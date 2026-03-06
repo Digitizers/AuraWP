@@ -1,10 +1,10 @@
-=== Aura Worker ===
+=== AuraWP ===
 Contributors: digitizer
 Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 1.1.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -12,7 +12,7 @@ Remote site management agent for Aura dashboard. Secure updates, health monitori
 
 == Description ==
 
-Aura Worker is a lightweight WordPress plugin that enables remote site management through the Aura dashboard. It provides secure REST API endpoints for:
+AuraWP is a lightweight WordPress plugin that enables remote site management through the Aura dashboard. It provides secure REST API endpoints for:
 
 * **Site Health Status** - WordPress version, PHP version, plugins, themes, database info, disk usage
 * **Plugin Updates** - Update individual plugins remotely
@@ -40,7 +40,7 @@ Three layers of authentication protect all API endpoints:
 
 1. Upload the `AuraWP` folder to `/wp-content/plugins/`
 2. Activate the plugin through the Plugins menu
-3. Go to Tools > Aura Worker to find your site token
+3. Go to Tools > AuraWP to find your site token
 4. Add the site token to your Aura dashboard
 
 == Frequently Asked Questions ==

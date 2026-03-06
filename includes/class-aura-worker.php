@@ -46,9 +46,9 @@ class Aura_Worker {
 	 * Add settings page under Tools menu.
 	 */
 	public function add_settings_page() {
-		add_management_page(
-			__( 'Aura Worker', 'aura-worker' ),
-			__( 'Aura Worker', 'aura-worker' ),
+		add_options_page(
+			__( 'AuraWP', 'aura-worker' ),
+			__( 'AuraWP', 'aura-worker' ),
 			'manage_options',
 			'aura-worker',
 			array( $this, 'render_settings_page' )
