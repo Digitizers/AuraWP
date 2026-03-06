@@ -1,5 +1,5 @@
 === AuraWP ===
-Contributors: digitizer
+Contributors: Digitizer
 Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
