@@ -26,9 +26,9 @@ AuraWP/
 ├── uninstall.php                            # Cleanup on uninstall (removes all options)
 ├── readme.txt                               # WordPress.org plugin readme
 ├── README.md                                # GitHub readme
-├── aura_logotype.png                        # Logo asset
 ├── LICENSE                                  # GPLv2 license text
 ├── assets/                                  # WordPress.org plugin page assets (NOT shipped)
+│   ├── aura_logotype.png                    # Logo asset
 │   ├── banner-772x250.svg                   # Standard banner
 │   ├── banner-1544x500.svg                  # Retina banner
 │   ├── icon-128x128.svg                     # Standard icon
