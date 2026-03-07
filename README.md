@@ -6,7 +6,7 @@
 
 <p align="center">
   Lightweight WordPress plugin that connects your sites to the<br/>
-  <a href="https://github.com/Digitizers/Aura"><strong>Aura Infrastructure Hub</strong></a>
+  <a href="https://my-aura.app"><strong>Aura Infrastructure Hub</strong></a>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 ## What is AuraWP?
 
-AuraWP is a remote management agent that runs on your WordPress sites and communicates with the [Aura dashboard](https://github.com/Digitizers/Aura). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates, and perform maintenance — all from a single centralized interface.
+AuraWP is a remote management agent that runs on your WordPress sites and communicates with the [Aura dashboard](https://my-aura.app). It exposes secure REST API endpoints that allow Aura to monitor site health, apply updates, and perform maintenance — all from a single centralized interface.
 
 > **Aura** is a full-stack, multi-provider infrastructure dashboard that unifies server, application, DNS, and CDN management across **Cloudways**, **Hostinger VPS**, **Cloudflare**, and **Bunny.net**. AuraWP extends that reach directly into your WordPress installations.
 
@@ -119,7 +119,7 @@ AuraWP/
 <table>
   <tr>
     <td width="50%" valign="top">
-      <h4><a href="https://github.com/Digitizers/Aura">Aura &mdash; Infrastructure Hub</a></h4>
+      <h4><a href="https://my-aura.app">Aura &mdash; Infrastructure Hub</a></h4>
       <p>The central dashboard that manages servers, applications, DNS zones, and CDN pull zones across Cloudways, Hostinger VPS, Cloudflare, and Bunny.net.</p>
       <p><sub>Next.js &middot; TypeScript &middot; Prisma &middot; PostgreSQL</sub></p>
     </td>
@@ -178,4 +178,4 @@ GPLv2 or later — [License](https://www.gnu.org/licenses/gpl-2.0.html)
 
 ---
 
-Built with care by [Digitizer](https://www.digitizer.studio) for the [Aura](https://github.com/Digitizers/Aura) ecosystem
+Built with care by [Digitizer](https://www.digitizer.studio) for the [Aura](https://my-aura.app) ecosystem
