@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/WordPress-6.2%2B-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
   <img src="https://img.shields.io/badge/License-GPLv2-blue" alt="License" />
-  <img src="https://img.shields.io/badge/Version-1.1.0-green" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-1.2.0-green" alt="Version" />
 </p>
 
 ---
@@ -156,6 +156,19 @@ Yes. All endpoints require three layers of authentication. No actions can be per
 ---
 
 ## Changelog
+
+### 1.2.0
+- Security: Fix IP whitelist bypass — now uses only `REMOTE_ADDR`
+- Security: Standardize capability checks to `manage_options` for all endpoints
+- Security: Protect site token from form overwrite
+- Security: Add input validation for plugin/theme parameters
+- Security: PHP 8 compatibility for token comparison
+- Fix: `update_core()` missing error checks and wrong sprintf type
+- Fix: `update_plugin()`/`update_theme()` treated null return as success
+- Fix: `update_translations()` silent failure on error
+- Fix: Raw SQL in status endpoint now uses `$wpdb->prepare()`
+- Fix: Disk usage iterator optimization
+- Cleanup: Removed redundant code and unnecessary `flush_rewrite_rules()`
 
 ### 1.1.0
 - Memory optimization for update operations (auto-scales to 256MB)

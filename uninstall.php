@@ -17,3 +17,4 @@ delete_option( 'aura_worker_activated' );
 delete_option( 'aura_worker_version' );
 delete_option( 'aura_worker_site_token' );
 delete_option( 'aura_worker_allowed_ips' );
+delete_option( 'aura_worker_allowed_domains' );

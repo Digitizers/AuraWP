@@ -178,6 +178,13 @@ class Aura_Worker_Updater {
 			);
 		}
 
+		if ( null === $result ) {
+			return array(
+				'success' => false,
+				'error'   => __( 'No update available for this plugin.', 'aura-worker' ),
+			);
+		}
+
 		return array(
 			'success' => true,
 			'message' => __( 'Plugin updated successfully.', 'aura-worker' ),
@@ -211,6 +218,13 @@ class Aura_Worker_Updater {
 			);
 		}
 
+		if ( null === $result ) {
+			return array(
+				'success' => false,
+				'error'   => __( 'No update available for this theme.', 'aura-worker' ),
+			);
+		}
+
 		return array(
 			'success' => true,
 			'message' => __( 'Theme updated successfully.', 'aura-worker' ),
@@ -224,20 +238,20 @@ class Aura_Worker_Updater {
 	 */
 	public function update_core() {
 		$this->load_upgrade_dependencies();
-		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 
 		$updates = get_core_updates();
 
-		if ( empty( $updates ) || 'latest' === $updates[0]->response ) {
+		if ( empty( $updates ) || ! is_array( $updates ) || 'latest' === $updates[0]->response ) {
 			return array(
 				'success' => true,
 				'message' => __( 'WordPress is already up to date.', 'aura-worker' ),
 			);
 		}
 
+		$update   = $updates[0];
 		$skin     = new Automatic_Upgrader_Skin();
 		$upgrader = new Core_Upgrader( $skin );
-		$result   = $upgrader->upgrade( $updates[0] );
+		$result   = $upgrader->upgrade( $update );
 
 		if ( is_wp_error( $result ) ) {
 			return array(
@@ -246,12 +260,19 @@ class Aura_Worker_Updater {
 			);
 		}
 
+		if ( false === $result ) {
+			return array(
+				'success' => false,
+				'error'   => __( 'Core update failed (filesystem error).', 'aura-worker' ),
+			);
+		}
+
 		return array(
 			'success' => true,
 			'message' => sprintf(
 				/* translators: %s: WordPress version */
 				__( 'WordPress updated to %s.', 'aura-worker' ),
-				$result
+				$update->version
 			),
 		);
 	}
@@ -268,10 +289,10 @@ class Aura_Worker_Updater {
 		$upgrader = new Language_Pack_Upgrader( $skin );
 		$result   = $upgrader->bulk_upgrade();
 
-		if ( is_wp_error( $result ) ) {
+		if ( false === $result ) {
 			return array(
 				'success' => false,
-				'error'   => $result->get_error_message(),
+				'error'   => __( 'Translation update failed.', 'aura-worker' ),
 			);
 		}
 

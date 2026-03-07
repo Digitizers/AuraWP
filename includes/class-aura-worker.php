@@ -61,10 +61,18 @@ class Aura_Worker {
 	public function register_settings() {
 		register_setting( 'aura_worker_settings', 'aura_worker_site_token', array(
 			'type'              => 'string',
-			'sanitize_callback' => 'sanitize_text_field',
+			'sanitize_callback' => function( $new_value ) {
+				// Token is read-only; always preserve the existing value.
+				return get_option( 'aura_worker_site_token', $new_value );
+			},
 		) );
 
 		register_setting( 'aura_worker_settings', 'aura_worker_allowed_ips', array(
+			'type'              => 'string',
+			'sanitize_callback' => 'sanitize_textarea_field',
+		) );
+
+		register_setting( 'aura_worker_settings', 'aura_worker_allowed_domains', array(
 			'type'              => 'string',
 			'sanitize_callback' => 'sanitize_textarea_field',
 		) );
@@ -88,6 +96,14 @@ class Aura_Worker {
 			'aura_worker_allowed_ips',
 			__( 'Allowed IPs', 'aura-worker' ),
 			array( $this, 'render_ips_field' ),
+			'aura-worker',
+			'aura_worker_main'
+		);
+
+		add_settings_field(
+			'aura_worker_allowed_domains',
+			__( 'Allowed Domains', 'aura-worker' ),
+			array( $this, 'render_domains_field' ),
 			'aura-worker',
 			'aura_worker_main'
 		);
@@ -151,6 +167,19 @@ class Aura_Worker {
 		<textarea name="aura_worker_allowed_ips" rows="3" class="large-text"><?php echo esc_textarea( $ips ); ?></textarea>
 		<p class="description">
 			<?php esc_html_e( 'One IP per line. Leave empty to allow all IPs (less secure). Only these IPs can access the Aura API.', 'aura-worker' ); ?>
+		</p>
+		<?php
+	}
+
+	/**
+	 * Render the allowed domains field.
+	 */
+	public function render_domains_field() {
+		$domains = get_option( 'aura_worker_allowed_domains', '' );
+		?>
+		<textarea name="aura_worker_allowed_domains" rows="3" class="large-text"><?php echo esc_textarea( $domains ); ?></textarea>
+		<p class="description">
+			<?php esc_html_e( 'One domain per line (e.g., my-aura.app). Leave empty to allow all origins. Checked against the Origin or Referer header of incoming requests.', 'aura-worker' ); ?>
 		</p>
 		<?php
 	}

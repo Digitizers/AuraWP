@@ -149,15 +149,12 @@ All options are cleaned up in `uninstall.php`.
 
 ## Known Issues
 
-These are known issues identified during code review that should be addressed:
+Most issues from the initial code review were fixed in v1.2.0. Remaining items:
 
-1. **IP whitelist bypass** — `get_client_ip()` trusts spoofable proxy headers (`X-Forwarded-For`, `X-Real-IP`) before `REMOTE_ADDR`. Should only use `REMOTE_ADDR` or make proxy trust opt-in.
-2. **`update_core()` missing `false` check** — `Core_Upgrader::upgrade()` returns `false` on filesystem failure, but only `is_wp_error()` is checked. Also passes `$result` (an array) to `sprintf()` instead of `$updates[0]->version`.
-3. **`update_plugin()`/`update_theme()` treat `null` as success** — Upgraders can return `null` when no update is available; this falls through to the success branch.
-4. **`update_translations()` dead error check** — `Language_Pack_Upgrader::bulk_upgrade()` never returns `WP_Error`, so the `is_wp_error()` check is unreachable. `false` return is silently reported as success.
-5. **Raw SQL in `get_status()`** — `$wpdb->prefix` is interpolated into a `SHOW TABLES LIKE` query without `$wpdb->prepare()` or `$wpdb->esc_like()`.
-6. **Token stored in plaintext** — The site token is stored as-is in `wp_options`. Should store a hash.
-7. **Duplicate `require_once`** in `update_core()` — `class-wp-upgrader.php` is loaded by both `load_upgrade_dependencies()` and an explicit `require_once` on the next line.
+1. **Token stored in plaintext** — The site token is stored as-is in `wp_options`. Ideally should store a SHA-256 hash and only show the raw token once at generation. Low risk since the token is already protected by the settings page capability check.
+2. **No token rotation UI** — There is no "Regenerate Token" button. The only way to rotate is to delete the option and re-activate the plugin.
+3. **No rate limiting on token validation** — An attacker can brute-force the `X-Aura-Token` header without throttling. Consider adding transient-based failed-attempt tracking.
+4. **`update_database()` always returns success** — `wp_upgrade()` has no error channel; SQL failures are silently swallowed.
 
 ---
 

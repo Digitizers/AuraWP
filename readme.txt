@@ -4,7 +4,7 @@ Tags: management, maintenance, updates, remote, dashboard
 Requires at least: 6.2
 Tested up to: 6.9
 Requires PHP: 7.4
-Stable tag: 1.1.0
+Stable tag: 1.2.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -58,6 +58,22 @@ No. The plugin only loads its REST API endpoints. It has zero impact on frontend
 Your Aura dashboard will no longer be able to communicate with this site. No data is lost.
 
 == Changelog ==
+
+= 1.2.0 =
+* Security: Fix IP whitelist bypass via spoofable proxy headers — now uses REMOTE_ADDR only
+* Security: Standardize capability checks to manage_options for all endpoints
+* Security: Protect site token from form overwrite via sanitize_callback
+* Security: Cast token header to string for PHP 8 compatibility
+* Security: Add validate_callback with regex for plugin/theme parameters
+* Fix: update_core() missing false check — filesystem failures silently reported success
+* Fix: update_core() sprintf received array instead of version string
+* Fix: update_core() missing is_array guard before accessing updates array
+* Fix: update_plugin() and update_theme() treated null return as success
+* Fix: update_translations() dead is_wp_error check — false return reported as success
+* Fix: Raw SQL interpolation in get_status() — now uses $wpdb->prepare()
+* Fix: Disk usage iterator changed from SELF_FIRST to LEAVES_ONLY
+* Cleanup: Removed duplicate require_once in update_core()
+* Cleanup: Removed unnecessary flush_rewrite_rules() calls
 
 = 1.0.0 =
 * Initial release

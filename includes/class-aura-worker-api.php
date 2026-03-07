@@ -79,6 +79,9 @@ class Aura_Worker_API {
 					'required'          => true,
 					'type'              => 'string',
 					'sanitize_callback' => 'sanitize_text_field',
+					'validate_callback' => function( $value ) {
+						return is_string( $value ) && preg_match( '/^[a-zA-Z0-9_\-]+\/[a-zA-Z0-9_\-]+\.php$/', $value );
+					},
 					'description'       => __( 'Plugin file path (e.g., akismet/akismet.php)', 'aura-worker' ),
 				),
 			),
@@ -94,6 +97,9 @@ class Aura_Worker_API {
 					'required'          => true,
 					'type'              => 'string',
 					'sanitize_callback' => 'sanitize_text_field',
+					'validate_callback' => function( $value ) {
+						return is_string( $value ) && preg_match( '/^[a-zA-Z0-9_\-]+$/', $value );
+					},
 					'description'       => __( 'Theme stylesheet slug', 'aura-worker' ),
 				),
 			),
@@ -173,7 +179,7 @@ class Aura_Worker_API {
 				'active' => count( $active_plugins ),
 			),
 			'db_prefix'           => $wpdb->prefix,
-			'db_tables'           => count( $wpdb->get_results( "SHOW TABLES LIKE '{$wpdb->prefix}%'" ) ),
+			'db_tables'           => count( $wpdb->get_results( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ) ) ),
 			'disk_usage'          => $this->get_disk_usage(),
 			'server_software'     => isset( $_SERVER['SERVER_SOFTWARE'] ) ? sanitize_text_field( wp_unslash( $_SERVER['SERVER_SOFTWARE'] ) ) : '',
 			'timestamp'           => gmdate( 'c' ),
@@ -300,7 +306,7 @@ class Aura_Worker_API {
 		$size = 0;
 		$iter = new RecursiveIteratorIterator(
 			new RecursiveDirectoryIterator( $upload_path, RecursiveDirectoryIterator::SKIP_DOTS ),
-			RecursiveIteratorIterator::SELF_FIRST,
+			RecursiveIteratorIterator::LEAVES_ONLY,
 			RecursiveIteratorIterator::CATCH_GET_CHILD
 		);
 

@@ -23,10 +23,16 @@ class Aura_Worker_Security {
 	 * @return bool|WP_Error True if valid, WP_Error otherwise.
 	 */
 	public function validate_request( $request ) {
-		// Layer 1: Check IP whitelist (if configured).
+		// Layer 1a: Check IP whitelist (if configured).
 		$ip_check = $this->check_ip_whitelist();
 		if ( is_wp_error( $ip_check ) ) {
 			return $ip_check;
+		}
+
+		// Layer 1b: Check domain whitelist (if configured).
+		$domain_check = $this->check_domain_whitelist( $request );
+		if ( is_wp_error( $domain_check ) ) {
+			return $domain_check;
 		}
 
 		// Layer 2: Verify Aura site token.
@@ -68,13 +74,53 @@ class Aura_Worker_Security {
 	}
 
 	/**
+	 * Check if the request origin domain is in the allowed list.
+	 *
+	 * @param WP_REST_Request $request The incoming request.
+	 * @return bool|WP_Error True if allowed, WP_Error if blocked.
+	 */
+	private function check_domain_whitelist( $request ) {
+		$allowed_domains = get_option( 'aura_worker_allowed_domains', '' );
+
+		// If no domains configured, allow all.
+		if ( empty( trim( $allowed_domains ) ) ) {
+			return true;
+		}
+
+		$allowed = array_filter( array_map( 'trim', explode( "\n", strtolower( $allowed_domains ) ) ) );
+
+		// Check Origin header first, then Referer as fallback.
+		$origin  = $request->get_header( 'Origin' );
+		$referer = $request->get_header( 'Referer' );
+
+		$request_host = '';
+		if ( ! empty( $origin ) ) {
+			$parsed = wp_parse_url( $origin );
+			$request_host = isset( $parsed['host'] ) ? strtolower( $parsed['host'] ) : '';
+		} elseif ( ! empty( $referer ) ) {
+			$parsed = wp_parse_url( $referer );
+			$request_host = isset( $parsed['host'] ) ? strtolower( $parsed['host'] ) : '';
+		}
+
+		if ( empty( $request_host ) || ! in_array( $request_host, $allowed, true ) ) {
+			return new WP_Error(
+				'aura_domain_blocked',
+				__( 'Your request origin domain is not authorized.', 'aura-worker' ),
+				array( 'status' => 403 )
+			);
+		}
+
+		return true;
+	}
+
+	/**
 	 * Verify the Aura site token from request headers.
 	 *
 	 * @param WP_REST_Request $request The incoming request.
 	 * @return bool|WP_Error True if valid, WP_Error if invalid.
 	 */
 	private function check_aura_token( $request ) {
-		$provided_token = $request->get_header( 'X-Aura-Token' );
+		$provided_token = (string) $request->get_header( 'X-Aura-Token' );
 		$stored_token   = get_option( 'aura_worker_site_token', '' );
 
 		if ( empty( $stored_token ) ) {
@@ -102,23 +148,12 @@ class Aura_Worker_Security {
 	 * @return string Client IP.
 	 */
 	private function get_client_ip() {
-		// Check common proxy headers (in order of trust).
-		$headers = array(
-			'HTTP_CF_CONNECTING_IP', // Cloudflare
-			'HTTP_X_FORWARDED_FOR',
-			'HTTP_X_REAL_IP',
-			'REMOTE_ADDR',
-		);
-
-		foreach ( $headers as $header ) {
-			if ( ! empty( $_SERVER[ $header ] ) ) {
-				// X-Forwarded-For can contain multiple IPs; take the first.
-				$ip = explode( ',', sanitize_text_field( wp_unslash( $_SERVER[ $header ] ) ) );
-				return trim( $ip[0] );
-			}
-		}
-
-		return '0.0.0.0';
+		// Only trust REMOTE_ADDR — proxy headers (X-Forwarded-For, CF-Connecting-IP)
+		// are client-controlled and trivially spoofed. Managed hosts and reverse proxies
+		// should be configured to set REMOTE_ADDR correctly at the server layer.
+		return isset( $_SERVER['REMOTE_ADDR'] )
+			? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) )
+			: '0.0.0.0';
 	}
 
 	/**
@@ -135,7 +170,7 @@ class Aura_Worker_Security {
 		}
 
 		// Then check WordPress capability.
-		if ( ! current_user_can( 'update_plugins' ) ) {
+		if ( ! current_user_can( 'manage_options' ) ) {
 			return new WP_Error(
 				'aura_insufficient_permissions',
 				__( 'You do not have permission to perform this action.', 'aura-worker' ),

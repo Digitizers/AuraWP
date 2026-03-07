@@ -3,7 +3,7 @@
  * Plugin Name:       AuraWP
  * Plugin URI:        https://github.com/Digitizers/AuraWP
  * Description:       Remote site management agent for Aura dashboard. Enables secure updates, health monitoring, and maintenance operations via REST API.
- * Version:           1.1.0
+ * Version:           1.2.0
  * Requires at least: 6.2
  * Requires PHP:      7.4
  * Author:            Digitizer
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'AURA_WORKER_VERSION', '1.1.0' );
+define( 'AURA_WORKER_VERSION', '1.2.0' );
 define( 'AURA_WORKER_FILE', __FILE__ );
 define( 'AURA_WORKER_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -50,9 +50,6 @@ function aura_worker_activate() {
 	if ( ! get_option( 'aura_worker_site_token' ) ) {
 		update_option( 'aura_worker_site_token', wp_generate_password( 32, false ) );
 	}
-
-	// Flush rewrite rules for REST API.
-	flush_rewrite_rules();
 }
 register_activation_hook( __FILE__, 'aura_worker_activate' );
 
@@ -60,6 +57,6 @@ register_activation_hook( __FILE__, 'aura_worker_activate' );
  * Deactivation hook.
  */
 function aura_worker_deactivate() {
-	flush_rewrite_rules();
+	// Nothing to clean up on deactivation; options are removed on uninstall.
 }
 register_deactivation_hook( __FILE__, 'aura_worker_deactivate' );
