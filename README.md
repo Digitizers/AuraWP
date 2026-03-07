@@ -1,4 +1,7 @@
 <p align="center">
+  <img src="assets/aura_icon.png" alt="Aura" width="160" />
+</p>
+<p align="center">
   <img src="assets/aura_logotype.png" alt="Aura" width="200" />
 </p>
 
