@@ -814,9 +814,13 @@ class Aura_Worker_Snapshots {
 	 */
 	private function restore_created_file( array $record ) {
 		$target = isset( $record['target'] ) ? (string) $record['target'] : '';
-		if ( '' === $target || ! file_exists( $target ) ) {
+		if ( '' === $target || ! self::path_present( $target ) ) {
 			return array( 'success' => true ); // already gone
 		}
+		// is_file() follows a symlink, so a DANGLING one reads as absent to
+		// file_exists() and as "not a file" here — it is a directory entry that
+		// can go live the moment its destination appears, never "already gone"
+		// (Codex #94 round-2 P2). It is reported, never deleted.
 		if ( ! is_file( $target ) ) {
 			return array( 'success' => false, 'error' => 'Target is not a regular file: ' . $target );
 		}
@@ -838,7 +842,7 @@ class Aura_Worker_Snapshots {
 		}
 		$claim = dirname( $target ) . '/.aura-restore-' . $suffix; // opaque, never a .php name
 		if ( ! @rename( $target, $claim ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.rename_rename -- The claim IS the point; $wp_filesystem->move() may copy+delete, which is neither atomic nor inode-preserving.
-			return file_exists( $target )
+			return self::path_present( $target )
 				? array( 'success' => false, 'error' => 'Unable to claim file for restore: ' . $target )
 				: array( 'success' => true ); // it vanished between exists() and the claim: already gone
 		}
@@ -869,6 +873,18 @@ class Aura_Worker_Snapshots {
 			$out['moved_aside'] = $claim;
 		}
 		return $out;
+	}
+
+	/**
+	 * Whether a directory entry exists at the path — a regular file, a
+	 * directory, or a symlink whether or not its destination exists.
+	 * file_exists() alone answers false for a dangling symlink.
+	 *
+	 * @param string $path Path.
+	 * @return bool
+	 */
+	private static function path_present( $path ) {
+		return file_exists( $path ) || is_link( $path );
 	}
 
 	/**

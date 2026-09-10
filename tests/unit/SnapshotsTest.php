@@ -606,6 +606,23 @@ final class SnapshotsTest extends TestCase {
 		$this->assertFileDoesNotExist( $file );
 	}
 
+	public function test_a_dangling_symlink_at_the_created_path_is_reported_never_treated_as_gone(): void {
+		// Codex #94 round-2 P2: file_exists() answers false for a dangling
+		// symlink, so the restore used to report success and leave a directory
+		// entry that goes live the moment its destination appears.
+		$snaps = new Aura_Worker_Snapshots();
+		$file  = WP_CONTENT_DIR . '/new.php';
+		$rec   = $snaps->create_file( $file, "x\n" )['snapshot'];
+		unlink( $file );
+		symlink( WP_CONTENT_DIR . '/does-not-exist.php', $file );
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertStringContainsString( 'not a regular file', $restore['error'] );
+		$this->assertTrue( is_link( $file ), 'the symlink is reported, never deleted' );
+	}
+
 	public function test_restoring_a_created_file_that_is_already_gone_succeeds(): void {
 		$snaps = new Aura_Worker_Snapshots();
 		$file  = WP_CONTENT_DIR . '/new.php';
