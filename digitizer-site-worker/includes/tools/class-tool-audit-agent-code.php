@@ -379,7 +379,8 @@ class Aura_Tool_Audit_Agent_Code extends Aura_Tool_Base {
 				'orderby'          => 'modified',
 				'order'            => 'DESC',
 				'no_found_rows'    => true,
-				'suppress_filters' => true,
+				// get_posts() already defaults suppress_filters to true; saying so
+				// explicitly trips the wp.org Plugin Check (VIP sniff), so it is left implicit.
 			)
 		);
 		if ( ! is_array( $rows ) ) {
