@@ -2386,7 +2386,7 @@ class Aura_Worker_Rules {
 			'code'    => 'aura_rule_blocked',
 			'status'  => 403,
 			'error'   => sprintf(
-				'%s is blocked by %s%s — approval does not override a rule; release the rule first.',
+				'%s is blocked by %s%s — approval does not override a rule; scope the rule out of this site with `sites`, or release it.',
 				(string) $tool_name,
 				$key,
 				'' === $reason ? '' : ' (' . $reason . ')'

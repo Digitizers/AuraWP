@@ -481,7 +481,7 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
   a page holds against Aura's content tools, an assistant with an application
   password, or another plugin's MCP server alike. A `block` refuses the call and
   names the rule; **a rule outranks an approval** — a granted call is still
-  refused, and the message says to release the rule first. A `warn` runs and
+  refused, and the message says to scope the rule out of the site (Aura's "scope" on a rule, SiteAgent 2.12+) or release it. A `warn` runs and
   attaches the warning. Previews are never blocked; they now report what a call
   touches and which rule would decide it.
 * New: `audit_rules` (read-only) — ruleset presence and age, whether the site
