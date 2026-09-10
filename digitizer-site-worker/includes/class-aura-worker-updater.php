@@ -183,6 +183,11 @@ class Aura_Worker_Updater {
 	public function self_update( $zip_url, $expected_sha256 = '' ) {
 		$this->load_upgrade_dependencies();
 
+		$refused = $this->self_mutation_refusal( self::SELF_PLUGIN_FILE );
+		if ( null !== $refused ) {
+			return $refused; // SA#79 — before any claim, download or write
+		}
+
 		// ONE self-update at a time per site (Codex round-20 P1). The verdict
 		// rests on a single nonce option: a second request overlapping the first
 		// overwrote it before the first loopback wrote its beacon, so the first
@@ -1042,7 +1047,10 @@ class Aura_Worker_Updater {
 				return null;
 			}
 			return $rollback->restore_plugin( $plugin_slug, $backup_path );
-		}, $busy );
+		}, $busy, $refused );
+		if ( null !== $refused ) {
+			return $refused;
+		}
 		if ( $busy || $lost ) {
 			return $this->self_update_busy();
 		}
@@ -1068,10 +1076,15 @@ class Aura_Worker_Updater {
 	 *                              claim was taken) so it can renew the lease
 	 *                              between long phases (SA#80).
 	 * @param bool     $busy        Out: true when refused for a held claim.
-	 * @return mixed $work's return, or null when busy.
+	 * @param array|null $refused   Out: the SA#79 multisite refusal, or null.
+	 * @return mixed $work's return, or null when busy or refused.
 	 */
-	private function guarding_self( $plugin_file, $work, &$busy ) {
-		$busy = false;
+	private function guarding_self( $plugin_file, $work, &$busy, &$refused = null ) {
+		$busy    = false;
+		$refused = $this->self_mutation_refusal( $plugin_file );
+		if ( null !== $refused ) {
+			return null; // SA#79: nothing runs, no claim is taken
+		}
 		if ( self::SELF_PLUGIN_FILE !== $plugin_file ) {
 			return $work( '' ); // no claim: another plugin's files are not ours to serialise
 		}
@@ -1088,6 +1101,32 @@ class Aura_Worker_Updater {
 		} finally {
 			Aura_Worker_Magic_Link::release_claim( self::SELF_UPDATE_LOCK, $fence );
 		}
+	}
+
+	/**
+	 * The refusal every Aura-driven mutation of SiteAgent's OWN files answers
+	 * on a multisite network (SA#79): the self-update claim is stored per blog
+	 * while the plugin directory is shared by the whole network, so two
+	 * subsites could each take their own claim and replace the same files
+	 * concurrently. Until the claim lives in network-wide state, every path
+	 * that reaches this directory under that claim — self_update(), the
+	 * generic single update, the batch entry, the guarded rollback — refuses
+	 * before any claim, download or write, rather than racing. Other plugins
+	 * are not this plugin's files and are not refused.
+	 *
+	 * @param string $plugin_file Plugin being mutated.
+	 * @return array|null The refusal, or null when the mutation may proceed.
+	 */
+	private function self_mutation_refusal( $plugin_file ) {
+		if ( self::SELF_PLUGIN_FILE !== $plugin_file || ! function_exists( 'is_multisite' ) || ! is_multisite() ) {
+			return null;
+		}
+		return array(
+			'success'     => false,
+			'code'        => 'aura_self_update_multisite_unsupported',
+			'error'       => __( 'Updating SiteAgent through Aura is not supported on a multisite network: the update lock is per site while the plugin directory is shared. Update the plugin from the network admin.', 'digitizer-site-worker' ),
+			'in_progress' => false,
+		);
 	}
 
 	/**
@@ -1123,7 +1162,10 @@ class Aura_Worker_Updater {
 				$upgrader = new Plugin_Upgrader( $skin );
 				return $upgrader->upgrade( $plugin_file );
 			} );
-		}, $busy );
+		}, $busy, $refused );
+		if ( null !== $refused ) {
+			return $refused;
+		}
 		if ( $busy ) {
 			return $this->self_update_busy();
 		}
@@ -1330,8 +1372,14 @@ class Aura_Worker_Updater {
 				// and says why, and the rest of the batch is unaffected.
 				$entry = $this->guarding_self( $plugin_file, function ( $fence ) use ( $plugin_file, $rollback, $health, $create_backup ) {
 					return $this->batch_update_one( $plugin_file, $rollback, $health, $create_backup, $fence );
-				}, $busy );
-				if ( $busy ) {
+				}, $busy, $refused );
+				if ( null !== $refused ) {
+					$entry = array(
+						'plugin' => $plugin_file,
+						'status' => 'failed',
+						'detail' => $refused['error'],
+					);
+				} elseif ( $busy ) {
 					$entry = array(
 						'plugin' => $plugin_file,
 						'status' => 'skipped',

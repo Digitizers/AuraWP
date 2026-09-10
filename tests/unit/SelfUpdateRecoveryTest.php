@@ -1066,4 +1066,59 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertTrue( $res['in_progress'] );
 		$this->assertStringContainsString( 'NEW BUILD', file_get_contents( $this->dir . '/digitizer-site-worker.php' ), 'nothing restored after the claim was lost' );
 	}
+
+	public function test_on_multisite_the_generic_paths_refuse_siteagent_and_leave_other_plugins_alone(): void {
+		// Codex #91 round-1 P1: /v2/update/batch, update_plugin_safely and the
+		// generic rollback reach SiteAgent's own directory under the same
+		// per-blog claim, so refusing only self_update() left the race open.
+		$GLOBALS['_is_multisite'] = true;
+		$updater = new Aura_Worker_Updater();
+
+		$single = $updater->update_plugin( Aura_Worker_Updater::SELF_PLUGIN_FILE );
+		$this->assertFalse( $single['success'] );
+		$this->assertSame( 'aura_self_update_multisite_unsupported', $single['code'] );
+		$this->assertNotContains( 'Plugin_Upgrader::upgrade', $GLOBALS['_mutations'] );
+
+		$other = $updater->update_plugin( 'akismet/akismet.php' );
+		$this->assertTrue( $other['success'], 'another plugin is not held up' );
+
+		$batch = $updater->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE, 'akismet/akismet.php' ), 5, false );
+		$by    = array();
+		foreach ( $batch['results'] as $r ) {
+			$by[ $r['plugin'] ] = $r;
+		}
+		$this->assertSame( 'failed', $by[ Aura_Worker_Updater::SELF_PLUGIN_FILE ]['status'] );
+		$this->assertStringContainsString( 'multisite', $by[ Aura_Worker_Updater::SELF_PLUGIN_FILE ]['detail'] );
+		$this->assertSame( 'updated', $by['akismet/akismet.php']['status'] );
+
+		if ( ! class_exists( 'Aura_Worker_Rollback' ) ) {
+			require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-rollback.php';
+		}
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+		$res = $updater->restore_plugin_guarded( $rollback, $this->slug, $backup['backup_path'] );
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'aura_self_update_multisite_unsupported', $res['code'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk(), 'nothing restored' );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'no claim taken on any refused path' );
+	}
+
+	public function test_a_multisite_network_is_refused_before_any_claim_download_or_write(): void {
+		// SA#79: the self-update claim is per blog, the plugin directory is
+		// network-wide, so two subsites could update the same files at once.
+		// Until the claim lives in network state, the self-update refuses on
+		// a network rather than race.
+		$GLOBALS['_is_multisite'] = true;
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'aura_self_update_multisite_unsupported', $res['code'] );
+		$this->assertStringContainsString( 'multisite', $res['error'] );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'no claim taken' );
+		$this->assertSame( array(), $GLOBALS['_wp_http_calls'], 'no download' );
+		$this->assertSame( 'OLD BUILD', $this->onDisk(), 'nothing written' );
+	}
 }
