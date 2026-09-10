@@ -420,7 +420,7 @@ statement reports it wrote the row.
 
 ### 2.9.0
 
-- **Security-audit read surface (6 tools).** `check_core_checksums` (core files vs the official wp.org manifest), `scan_executable_files` (PHP/executables, `.htaccess` overrides and symlinks under uploads), `audit_admin_accounts`, `audit_cron`, `audit_mcp_exposure`, and `audit_agent_code`. All read-only; all report bounded coverage and stop at a cap rather than growing without limit, and an empty result under `truncated: true` means "nothing found before the cap", never "clean".
+- **Security-audit read surface (5 tools).** `check_core_checksums` (core files vs the official wp.org manifest), `scan_executable_files` (PHP/executables, `.htaccess` overrides and symlinks under uploads), `audit_admin_accounts`, `audit_cron`, and `audit_mcp_exposure`. All read-only; all report bounded coverage and stop at a cap rather than growing without limit, and an empty result under `truncated: true` means "nothing found before the cap", never "clean".
 - **`audit_mcp_exposure`** answers the question that appears once a site runs more than one AI assistant: which other MCP servers are registered here, and how many abilities pass the discovery rule such a server applies. Abilities are registered site-wide, not to the plugin that declared them, so a server resolving targets from that registry (Angie's does) picks up mutating ones that never went through SiteAgent's approval path. The counts describe the abilities, not what any server currently serves.
 - Compatibility: declared tested up to WordPress 7.1.
 

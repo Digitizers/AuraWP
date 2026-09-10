@@ -67,6 +67,7 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 	protected function tearDown(): void {
 		unset( $GLOBALS['_install_effect'], $GLOBALS['_install_result'], $GLOBALS['_http_error'], $GLOBALS['_http_effect'] );
+		$GLOBALS['_is_multisite'] = false; // the two multisite refusal tests set it; nothing else in this class does
 		delete_option( 'aura_worker_boot' );
 		foreach ( array_keys( $GLOBALS['_options'] ?? array() ) as $k ) {
 			if ( 0 === strpos( (string) $k, 'aura_worker_boot_fatal' ) ) {

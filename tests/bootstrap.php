@@ -1484,6 +1484,12 @@ if ( ! function_exists( 'wp_mkdir_p' ) ) {
 
 if ( ! function_exists( 'wp_delete_file' ) ) {
 	function wp_delete_file( string $file ): bool {
+		// `_wp_delete_file_fail` names ONE path whose delete refuses without
+		// touching the file — a directory the process may write but not unlink
+		// from. Callers that must say where the bytes are can be tested there.
+		if ( isset( $GLOBALS['_wp_delete_file_fail'] ) && (string) $GLOBALS['_wp_delete_file_fail'] === $file ) {
+			return false;
+		}
 		$existed = file_exists( $file );
 		$ok      = @unlink( $file );
 		if ( $existed && $ok ) {
@@ -5147,6 +5153,7 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_app_password_scan_rewrite_probe'] = null; // stamps the OWNER rows of that answer with a foreign nonce (#434 Task 10).
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
 	$GLOBALS['_sa_app_password_create_fails']    = false;
+	$GLOBALS['_wp_delete_file_fail'] = null; // ONE path whose wp_delete_file() refuses; see the stub above.
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
 	$GLOBALS['_post_types']   = array(); // post_type_exists() — see the stub beside get_posts().

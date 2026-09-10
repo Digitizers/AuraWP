@@ -190,7 +190,7 @@ class Aura_Worker_Snapshots {
 	/** A staged file this old with no create in flight is a crash's leftover. */
 	const STAGE_MAX_AGE = 3600; // one hour — a literal, so the class needs no WordPress constant at load
 
-	/** At most this many stray staged files are swept per create. */
+	/** At most this many stray staged entries are examined per create. */
 	const STAGE_SWEEP_CAP = 50;
 
 	/**
@@ -206,6 +206,9 @@ class Aura_Worker_Snapshots {
 	 * its record, or holds bytes other than the complete content. Both other
 	 * orders were rejected in review: any order in which the TARGET exists
 	 * before the record is complete has a window.
+	 *
+	 * Path validation is the CALLER's: this method trusts `$path` and does no
+	 * jail check of its own — the Power Pack's `resolve_target()` owns that.
 	 *
 	 * @param string $path    Absolute path to create.
 	 * @param string $content Complete file content.
@@ -286,6 +289,11 @@ class Aura_Worker_Snapshots {
 		// and prune_older_than() remove what is left.
 		$this->discard_stage( $tmp );
 
+		// The PERSISTED record keeps `staged` — prune_older_than()'s sweep reads
+		// it from list_snapshots() — but the RETURNED one must not: step 4
+		// deleted that file, so it is a dead local path a caller could put on the wire.
+		unset( $record['staged'] );
+
 		return array( 'success' => true, 'snapshot' => $record );
 	}
 
@@ -337,6 +345,11 @@ class Aura_Worker_Snapshots {
 		}
 		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 
+		// fopen() takes the process umask, which on some hosts is group- or
+		// world-writable. link() preserves the mode, so whatever is set here is
+		// what the published target ends up with.
+		chmod( $tmp, defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_chmod -- $wp_filesystem is not initialised on this path, and the mode of a file this call exclusively created is not a filesystem abstraction concern.
+
 		if ( $written !== $len || ! $flushed ) {
 			return $this->discard_short_stage( $tmp );
 		}
@@ -368,6 +381,13 @@ class Aura_Worker_Snapshots {
 	 */
 	protected function publish( $tmp, $path ) {
 		$this->last_publish_detail = '';
+		// Fail closed, and SAY so: a host with link() in disable_functions makes
+		// the call warn and return null, which would otherwise be classified
+		// below as an ordinary refusal with no message to explain it.
+		if ( ! $this->link_available() ) {
+			$this->last_publish_detail = 'link() is disabled on this host';
+			return 'unsupported_filesystem';
+		}
 		error_clear_last();
 		$ok = @link( $tmp, $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is an expected answer, not a warning to surface; it is classified below.
 		if ( $ok ) {
@@ -384,6 +404,18 @@ class Aura_Worker_Snapshots {
 		// Any other refusal: the filesystem cannot give us an atomic, no-clobber
 		// publish. Fail closed — nothing was written at the target.
 		return 'unsupported_filesystem';
+	}
+
+	/**
+	 * Whether link() can be called on this host — a host may put it in
+	 * disable_functions, where calling it warns and returns null.
+	 *
+	 * Protected so a test can model such a host.
+	 *
+	 * @return bool
+	 */
+	protected function link_available() {
+		return function_exists( 'link' );
 	}
 
 	/**
@@ -437,11 +469,13 @@ class Aura_Worker_Snapshots {
 		}
 		$n = 0;
 		foreach ( $found as $stray ) {
-			if ( ++$n > self::STAGE_SWEEP_CAP ) {
-				break;
-			}
 			if ( ! is_file( $stray ) ) {
 				continue;
+			}
+			// Counted AFTER the is_file() check, so the cap bounds the files
+			// this sweep actually examines rather than whatever glob() listed.
+			if ( ++$n > self::STAGE_SWEEP_CAP ) {
+				break;
 			}
 			$at = filemtime( $stray );
 			if ( false !== $at && $at < $cut ) {
@@ -792,7 +826,9 @@ class Aura_Worker_Snapshots {
 			// The agent's bytes, verified on the file we hold. Remove them.
 			wp_delete_file( $claim );
 			if ( file_exists( $claim ) ) {
-				return array( 'success' => false, 'error' => 'Failed to delete file: ' . $claim );
+				// The agent's bytes are still on disk under the claim name; say
+				// where, as the file_changed_since branch below does.
+				return array( 'success' => false, 'error' => 'Failed to delete file: ' . $claim, 'moved_aside' => $claim );
 			}
 			return array( 'success' => true );
 		}
@@ -802,7 +838,9 @@ class Aura_Worker_Snapshots {
 		// path is taken — the changed file stays beside it under its claim name
 		// and the answer says where. Nothing is ever deleted on this branch.
 		$out = array( 'success' => false, 'error' => 'file_changed_since' );
-		if ( @link( $claim, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is the expected refusal, classified below.
+		// A host without link() takes the moved_aside branch outright: nothing is
+		// attempted at the target and, as on every path here, nothing is deleted.
+		if ( $this->link_available() && @link( $claim, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is the expected refusal, classified below.
 			wp_delete_file( $claim ); // the second name to the same inode; the file is back at its path
 		} else {
 			$out['moved_aside'] = $claim;

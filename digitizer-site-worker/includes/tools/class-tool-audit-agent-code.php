@@ -239,6 +239,11 @@ class Aura_Tool_Audit_Agent_Code extends Aura_Tool_Base {
 	 * count — exactly what Angie's loader includes; everything else is seen
 	 * and ignored (the loader ignores it too).
 	 *
+	 * `latest` (reported as `latest_deploy_at`) is the newest main.php mtime in
+	 * THIS environment: Angie's own get_snippet_environment_timestamps() is
+	 * deliberately not read — the mtime is the observable equivalent and needs
+	 * no Angie internal.
+	 *
 	 * @param string $dir Environment directory.
 	 * @return array { dirs: int|null, ids: int[], latest: int|null, seen: int, truncated: bool }
 	 */

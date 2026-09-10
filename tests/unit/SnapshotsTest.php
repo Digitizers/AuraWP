@@ -571,7 +571,9 @@ final class SnapshotsTest extends TestCase {
 		$this->assertFalse( $rec['existed'] );
 		$this->assertSame( hash( 'sha256', "<?php // agent\n" ), $rec['expected_sha256'] );
 		$this->assertArrayNotHasKey( 'payload_path', $rec, 'a created file has no payload — the record undoes content at a path' );
-		$this->assertFileDoesNotExist( $rec['staged'], 'the staged file is removed after publish' );
+		$this->assertArrayNotHasKey( 'staged', $rec, 'the returned record carries no local path' );
+		$this->assertFileDoesNotExist( $snaps->get( $rec['id'] )['staged'], 'the staged file is removed after publish' );
+		$this->assertSame( 0644, fileperms( $file ) & 0777, 'the created file does not inherit the umask' );
 
 		$restore = $snaps->restore( $rec['id'] );
 		$this->assertTrue( $restore['success'] );
@@ -897,6 +899,70 @@ final class SnapshotsTest extends TestCase {
 		$this->assertArrayNotHasKey( 'payload_path', $out['record'] );
 		$this->assertNull( $out['payload'] );
 		$this->assertFalse( $out['record']['existed'] );
+	}
+
+	public function test_a_delete_that_fails_after_the_claim_says_where_the_bytes_are(): void {
+		// The claim succeeded, so the target is gone from its path; the unlink
+		// of the claimed file then failed. The answer must name the claim, as
+		// the file_changed_since branch does — otherwise the agent's bytes sit
+		// somewhere nothing ever tells the operator about.
+		$file  = WP_CONTENT_DIR . '/undeletable.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function after_claim( $claim, $target ) {
+				$GLOBALS['_wp_delete_file_fail'] = $claim; // model a directory this process may write but not unlink from
+			}
+		};
+		$rec = $snaps->create_file( $file, "<?php // agent\n" )['snapshot'];
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertStringContainsString( 'Failed to delete file', $restore['error'] );
+		$this->assertArrayHasKey( 'moved_aside', $restore, 'the caller learns where the bytes are' );
+		$this->assertMatchesRegularExpression( '/\/\.aura-restore-[0-9a-f]{16}$/', $restore['moved_aside'] );
+		$this->assertFileExists( $restore['moved_aside'] );
+		$this->assertSame( "<?php // agent\n", file_get_contents( $restore['moved_aside'] ), "the agent's bytes, still on disk" );
+		$this->assertFileDoesNotExist( $file, 'the claim moved it off the path' );
+	}
+
+	public function test_a_host_with_link_disabled_fails_closed_with_nothing_at_the_target(): void {
+		// link() in disable_functions warns and returns null. Without the
+		// explicit guard that reads as an ordinary refusal carrying no message.
+		$file  = WP_CONTENT_DIR . '/nolinkfn.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function link_available() {
+				return false;
+			}
+		};
+
+		$res = $snaps->create_file( $file, "x\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'unsupported_filesystem', $res['error'] );
+		$this->assertSame( 'link() is disabled on this host', $res['detail'] );
+		$this->assertFileDoesNotExist( $file );
+		$this->assertSame( array(), $snaps->list_snapshots(), 'the record is deleted when publish is refused' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+	}
+
+	public function test_a_changed_file_is_kept_aside_when_the_host_cannot_link_it_back(): void {
+		$file  = WP_CONTENT_DIR . '/nolinkback.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			public $allow_link = true;
+			protected function link_available() {
+				return $this->allow_link;
+			}
+		};
+		$rec = $snaps->create_file( $file, "a\n" )['snapshot'];
+		file_put_contents( $file, "edited\n" );
+		$snaps->allow_link = false;
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertArrayHasKey( 'moved_aside', $restore );
+		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ), 'nothing is deleted on this branch' );
 	}
 }
 
