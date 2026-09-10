@@ -1027,6 +1027,42 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertFalse( $res['health_checked'] );
 	}
 
+	public function test_a_heartbeat_that_loses_the_claim_aborts_the_upgraders_pre_stages_and_passes_post_install_through(): void {
+		// Codex #94 round-3 P1: a claim seized between two sub-phases used to
+		// be noticed only after the whole phase. The three pre-stage filters
+		// are WordPress's own abort points (a WP_Error there runs nothing), so
+		// the heartbeat answers one from the first failed check on; the
+		// post-install filter, which fires after the files are replaced,
+		// passes through and the boundary check stops the entry.
+		$stamps  = array();
+		$updater = new class( $stamps ) extends Aura_Worker_Updater {
+			const LEASE_HEARTBEAT_SECONDS = 0;
+			private $stamps;
+			public function __construct( &$stamps ) { $this->stamps = &$stamps; }
+			protected function update_single_plugin( $plugin_file ) {
+				$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				$fence = substr( $held, 0, strpos( $held, '|' ) );
+				update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+				$this->stamps['successor'] = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+				$this->stamps['pre']       = apply_filters( 'upgrader_pre_install', true, array() );
+				$this->stamps['post']      = apply_filters( 'upgrader_post_install', true, array(), array() );
+				$this->stamps['pre_again'] = apply_filters( 'upgrader_pre_download', false, 'pkg', null, array() );
+				return array( 'success' => true );
+			}
+		};
+
+		$out = $updater->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE ), 5, false );
+
+		$this->assertNotSame( '', $stamps['successor'], 'the aged claim must be seizable' );
+		$this->assertInstanceOf( WP_Error::class, $stamps['pre'], 'a lost claim aborts the pre-install stage' );
+		$this->assertSame( 'aura_self_update_claim_lost', $stamps['pre']->get_error_code() );
+		$this->assertTrue( $stamps['post'], 'post-install passes its value through — the files are already replaced' );
+		$this->assertInstanceOf( WP_Error::class, $stamps['pre_again'], 'once lost, every later pre-stage aborts without re-checking' );
+		$this->assertSame( 'failed', $out['results'][0]['status'] );
+		$this->assertStringContainsString( 'Lost the self-update claim', $out['results'][0]['detail'] );
+		$this->assertStringStartsWith( $stamps['successor'] . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the successor\'s claim is untouched' );
+	}
+
 	public function test_a_self_update_whose_claim_was_seized_during_install_neither_restores_nor_probes(): void {
 		// Codex #91 round-3 P1: after install() the shipped code renewed the
 		// lease and carried on "because the rollback is still owed". A lost

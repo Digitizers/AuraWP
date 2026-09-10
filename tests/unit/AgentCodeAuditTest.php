@@ -186,6 +186,7 @@ final class AgentCodeAuditTest extends TestCase {
 		$this->assertFalse( $a['module_active'] );
 		$this->assertSame( 3, $a['total'] );
 		$this->assertSame( 2, $a['deployed']['prod']['dirs'] );
+		$this->assertNull( $a['active_env'], 'no loader runs with the module off — a callable dev-mode API must not make dormant code look live' );
 	}
 
 	public function test_no_snippet_directories_at_all_is_zero_not_null(): void {

@@ -340,13 +340,19 @@ class Aura_Worker_Snapshots {
 			$written += $n;
 		}
 		$flushed = fflush( $fh );
-		if ( function_exists( 'fsync' ) ) {
-			fsync( $fh ); // PHP 8.1+: the bytes reach the disk before the record names them.
-		}
+		// PHP 8.1+: the bytes reach the disk before the record names them. A
+		// refused fsync() is a refusal to publish (Codex #94 round-3 P2): a crash
+		// after a record that names bytes the disk never took would leave a
+		// missing or partial target under a "success".
+		$synced = function_exists( 'fsync' ) ? (bool) fsync( $fh ) : true;
 		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 
 		if ( $written !== $len || ! $flushed ) {
 			return $this->discard_short_stage( $tmp );
+		}
+		if ( ! $synced ) {
+			$this->discard_stage( $tmp );
+			return array( 'success' => false, 'error' => 'Unable to sync the staged file to disk: ' . $tmp );
 		}
 
 		// fopen() takes the process umask, which on some hosts is group- or

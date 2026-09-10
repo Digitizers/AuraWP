@@ -813,9 +813,12 @@ class Aura_Worker_Updater {
 	 * request from ever looking dead. The hooks pass their value through
 	 * untouched and are removed after the phase, whatever it returns.
 	 *
-	 * A lost lease is NOT acted on here: a phase cannot be aborted halfway
-	 * without leaving the directory incomplete. The check after the phase
-	 * (`lease_kept()`) is where a loss stops the work.
+	 * A lost lease is acted on only where WordPress itself can abort cleanly:
+	 * the three pre-stage filters answer a WP_Error, which the upgrader honours
+	 * before the stage touches anything. A phase already past its last
+	 * pre-stage cannot be aborted halfway without leaving the directory
+	 * incomplete, so `upgrader_post_install` passes through and the check
+	 * after the phase (`lease_kept()`) is where that loss stops the work.
 	 *
 	 * @param string   $fence The fence; '' runs $work plainly (no claim was taken).
 	 * @param callable $work  The phase.
@@ -826,21 +829,41 @@ class Aura_Worker_Updater {
 			return $work();
 		}
 		$last  = time();
-		$beat  = function ( $value ) use ( $fence, &$last ) {
-			if ( time() - $last >= static::LEASE_HEARTBEAT_SECONDS ) {
-				$this->keep_self_update_claim( $fence );
-				$last = time();
-			}
-			return $value;
-		};
+		$lost  = false;
+		// A failed heartbeat is REMEMBERED, and the three PRE-stage filters
+		// answer a WP_Error from then on (Codex #94 round-3 P1): WordPress
+		// honours a WP_Error from `upgrader_pre_download`,
+		// `upgrader_source_selection` and `upgrader_pre_install` by aborting
+		// BEFORE the stage runs — nothing downloaded, unpacked or written — so
+		// a request whose claim was seized between two sub-phases stops at the
+		// upgrader's own abort point instead of installing beside its
+		// successor. `upgrader_post_install` fires after the files are
+		// replaced; aborting there would only mislabel a finished install, so
+		// it passes its value through and the boundary check after the phase
+		// (`lease_kept()`) is what stops the work.
 		$hooks = array( 'upgrader_pre_download', 'upgrader_source_selection', 'upgrader_pre_install', 'upgrader_post_install' );
+		$beats = array(); // one closure per hook: the hook's name is bound, so no current_filter() lookup
 		foreach ( $hooks as $hook ) {
-			add_filter( $hook, $beat, 1 );
+			$abort          = 'upgrader_post_install' !== $hook;
+			$beats[ $hook ] = function ( $value ) use ( $fence, &$last, &$lost, $abort ) {
+				if ( ! $lost && time() - $last >= static::LEASE_HEARTBEAT_SECONDS ) {
+					$lost = ! $this->keep_self_update_claim( $fence );
+					$last = time();
+				}
+				if ( $lost && $abort ) {
+					return new WP_Error(
+						'aura_self_update_claim_lost',
+						__( 'SiteAgent lost its self-update claim mid-phase; another self-update took over on this site.', 'digitizer-site-worker' )
+					);
+				}
+				return $value;
+			};
+			add_filter( $hook, $beats[ $hook ], 1 );
 		}
 		try {
 			return $work();
 		} finally {
-			foreach ( $hooks as $hook ) {
+			foreach ( $beats as $hook => $beat ) {
 				remove_filter( $hook, $beat, 1 );
 			}
 		}
