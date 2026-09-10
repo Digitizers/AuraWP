@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.16.2-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.17.0-green" alt="Stable" />
 </p>
 
 ---
@@ -220,6 +220,7 @@ admin-ajax action, not by a REST route.
 | `audit_admin_accounts` | read | privileged-account facts: admins + recency, caps outside role, app-password counts, multisite super admins |
 | `audit_cron` | read | bounded WP-Cron inventory + fact-flags (sub-60s schedules, callbacks unresolved in this context) |
 | `audit_mcp_exposure` | read | other MCP servers registered on this site, and how many abilities pass the discovery rule such a server applies — a property of the abilities, not proof any server serves them; a registry-resolving server (Angie's) picks up mutating ones outside SiteAgent's approval path |
+| `audit_agent_code` | read | executable code an AI agent authored or can author here — Angie code snippets (recorded / agent-authored / live per environment, correlated per directory), the Power Pack's execute-php / file-write / wp-cli flags, third-party exec stores (EMCP Pro sandbox, Atarim) — counts and presence, never contents |
 | `audit_rules` | read | operator-ruleset presence + age, 24h block/warn counts, expired-but-listed rules, enforcement points in this build |
 | `snapshot_get` | read | retrieve a stored snapshot of page content (reversible write metadata) |
 | `elementor_replay_ability` | write | executes an approved held Elementor write (destructive, requires Aura approval) — claims the hold, re-judges it against the current ruleset, and runs the original mutation as the user who asked |
@@ -237,6 +238,12 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.17.0
+
+- New read-only tool `audit_agent_code` — executable code an AI agent authored or can author on this site: Angie code snippets (recorded / agent-authored / live in the environment the loader includes, correlated per `snippet-<id>` directory in both environments), the Power Pack's execute-php / file-write / wp-cli flags, and third-party exec stores (EMCP Pro sandbox, Atarim exec abilities). Counts and presence only, bounded and `null`-for-unreadable, `{ error }` per subtree. P4.6 piece 1; the Aura parser (Aura#509) grades it.
+- `Aura_Worker_Snapshots::create_file()` — stage → record → publish with `link()`; a created file is restored by deletion only while its bytes match (`file_changed_since` otherwise). P4.6 piece 2, base side.
+- SA#83 (`{}` for an empty parameter map), SA#80 (lease renewal on generic self-mutation paths), SA#79 (every Aura-driven mutation of SiteAgent's own files refused on multisite), and the `blocked_result()` sentence now points at scoping a rule with `sites`.
 
 ### 2.16.2
 
@@ -413,7 +420,7 @@ statement reports it wrote the row.
 
 ### 2.9.0
 
-- **Security-audit read surface (5 tools).** `check_core_checksums` (core files vs the official wp.org manifest), `scan_executable_files` (PHP/executables, `.htaccess` overrides and symlinks under uploads), `audit_admin_accounts`, `audit_cron`, and `audit_mcp_exposure`. All read-only; all report bounded coverage and stop at a cap rather than growing without limit, and an empty result under `truncated: true` means "nothing found before the cap", never "clean".
+- **Security-audit read surface (6 tools).** `check_core_checksums` (core files vs the official wp.org manifest), `scan_executable_files` (PHP/executables, `.htaccess` overrides and symlinks under uploads), `audit_admin_accounts`, `audit_cron`, `audit_mcp_exposure`, and `audit_agent_code`. All read-only; all report bounded coverage and stop at a cap rather than growing without limit, and an empty result under `truncated: true` means "nothing found before the cap", never "clean".
 - **`audit_mcp_exposure`** answers the question that appears once a site runs more than one AI assistant: which other MCP servers are registered here, and how many abilities pass the discovery rule such a server applies. Abilities are registered site-wide, not to the plugin that declared them, so a server resolving targets from that registry (Angie's does) picks up mutating ones that never went through SiteAgent's approval path. The counts describe the abilities, not what any server currently serves.
 - Compatibility: declared tested up to WordPress 7.1.
 

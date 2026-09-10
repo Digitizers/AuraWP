@@ -4,7 +4,7 @@ Tags: ai, automation, maintenance, updates, wordpress management
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 2.16.2
+Stable tag: 2.17.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -95,6 +95,7 @@ Read tools:
 * `audit_admin_accounts` — Privileged-account facts: administrators with recency, admin capabilities outside the role, application-password counts, multisite super admins
 * `audit_cron` — Bounded WP-Cron inventory with sub-60-second-schedule and unresolved-callback fact-flags
 * `audit_mcp_exposure` — Which other MCP servers are registered on this site, and how many abilities pass the discovery rule such a server applies (abilities are registered site-wide, not per-plugin, so a server resolving targets from that registry picks up mutating ones outside SiteAgent's approval path). The counts describe the abilities, not what any server currently serves. Reports only; changes nothing
+* `audit_agent_code` — Executable code an AI agent authored or can author on this site: Angie code snippets (recorded, agent-authored, live per environment), the SiteAgent Power Pack's execute-php / file-write / wp-cli flags, and third-party exec stores. Counts and presence only; never file contents, never a verdict. Reports only; changes nothing
 * `audit_rules` — Whether a signed operator ruleset is present and how old it is, 24h block/warn counts, expired-but-listed rules, and the enforcement points in this build. Reports only; changes nothing
 * `get_seo_meta` — Read a post/page's SEO title, description, and focus keyword from the active SEO plugin (Rank Math, Yoast, or SEOPress)
 * `list_page_blocks` — Read a page's Gutenberg block structure (block names, attributes, nesting)
@@ -251,6 +252,14 @@ Yes. SiteAgent is open source under the GPLv2 or later license. The source code 
 7. Connections: provider connections (Cloudways, Cloudflare, Bunny, Hostinger, Vultr, xCloud) with resource counts, status, and credential-rotation reminders.
 
 == Changelog ==
+
+= 2.17.0 =
+* New read-only tool `audit_agent_code`: executable code an AI agent authored or can author on this site — Angie code snippets (recorded, agent-authored, and which are live in the environment the loader includes, correlated per snippet directory in both environments), the SiteAgent Power Pack's execute-php / file-write / wp-cli flags, and third-party exec stores (EMCP Pro sandbox, Atarim exec abilities). Counts and presence only; never file contents, never a verdict. Bounded (200 directory entries per environment, `coverage.truncated`), `null` for anything unreadable, `{ error }` per subtree.
+* Snapshots: `create_file()` creates a NEW file with the engine owning the whole create — staged beside the target under a non-PHP name, recorded, then published with `link()` (atomic, no-clobber) — so no target ever exists without its record and no partial content is ever visible. Restoring the record claims the path with an atomic rename, verifies the claimed file, and removes it only while its bytes still match; a file edited since is put back and refused (`file_changed_since`), never deleted. The Power Pack's `write_file` adopts it in 0.2.4.
+* Tool metadata lists an empty parameter map as `{}` rather than `[]` (SA#83).
+* Generic SiteAgent mutations (batch entry, generic single update, generic rollback) renew the self-update lease between phases and heartbeat it from inside the upgrader's own sub-phases, so a slow download, unpack or install is never seized as stale, and a lost lease stops the entry rather than racing its successor (SA#80).
+* Every Aura-driven mutation of SiteAgent's own files — self-update, generic single update, the batch entry, the guarded rollback — refuses on a multisite network with `aura_self_update_multisite_unsupported`: the update lock is per site while the plugin directory is shared (SA#79). Other plugins are unaffected.
+* A rule-blocked call now says to scope the rule out of the site with `sites`, or release it.
 
 = 2.16.2 =
 * `/status`'s door fragment carries `observation`, a per-site door-version witness bumped atomically by every door-state mutation (never by a mere poll) and clock-floored so a restored backup can never reissue a value it already served, so Aura can order overlapping polls by the site's own witness instead of request timestamps; `elementor.governor` reports the current value. The observation witness requires InnoDB for wp_options and 64-bit PHP; without them ordering falls back to Aura's own request order for that site (`elementor.governor` reports why via `observation_unsupported`: `engine` or `php32`).
