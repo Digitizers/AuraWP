@@ -406,6 +406,14 @@ class Aura_Tool_Audit_Agent_Code extends Aura_Tool_Base {
 	/**
 	 * Seam: the Power Pack's constants. null when it is not installed.
 	 *
+	 * Flags are read by TRUTHINESS, not strict `true ===` — that is how the
+	 * Power Pack's own tools gate on them (siteagent-power-pack
+	 * class-tool-execute-php.php:153, class-tool-fs-write.php:195,
+	 * class-tool-wp-cli.php:209 all read `defined( 'X' ) && X`), so
+	 * `define( 'AURA_POWER_EXECUTE_PHP', 1 )` arms exec on the site and must
+	 * report `execute_php: true` here too — a strict compare would have been
+	 * a false negative against a site that can actually run PHP.
+	 *
 	 * @return array|null { version, execute_php, fs_write, wp_cli }
 	 */
 	protected function power_pack_env() {
@@ -414,9 +422,9 @@ class Aura_Tool_Audit_Agent_Code extends Aura_Tool_Base {
 		}
 		return array(
 			'version'     => (string) AURA_POWER_PACK_VERSION,
-			'execute_php' => defined( 'AURA_POWER_EXECUTE_PHP' ) && true === AURA_POWER_EXECUTE_PHP,
-			'fs_write'    => defined( 'AURA_POWER_ALLOW_FS_WRITE' ) && true === AURA_POWER_ALLOW_FS_WRITE,
-			'wp_cli'      => defined( 'AURA_POWER_ALLOW_WP_CLI' ) && true === AURA_POWER_ALLOW_WP_CLI,
+			'execute_php' => defined( 'AURA_POWER_EXECUTE_PHP' ) && (bool) AURA_POWER_EXECUTE_PHP,
+			'fs_write'    => defined( 'AURA_POWER_ALLOW_FS_WRITE' ) && (bool) AURA_POWER_ALLOW_FS_WRITE,
+			'wp_cli'      => defined( 'AURA_POWER_ALLOW_WP_CLI' ) && (bool) AURA_POWER_ALLOW_WP_CLI,
 		);
 	}
 
