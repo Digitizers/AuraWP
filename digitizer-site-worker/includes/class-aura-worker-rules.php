@@ -2371,8 +2371,8 @@ class Aura_Worker_Rules {
 
 	/**
 	 * The tool-result array for a refusal. Says plainly that approval does not
-	 * help — the operator has to release the rule — so nobody goes looking for
-	 * a grant bug.
+	 * help — the operator scopes the rule out of this site with `sites`, or
+	 * releases it — so nobody goes looking for a grant bug.
 	 *
 	 * @param string $tool_name Tool.
 	 * @param array  $rule      Deciding rule.
