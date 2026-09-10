@@ -88,6 +88,22 @@ final class ToolBaseTest extends TestCase {
 		$this->assertArrayHasKey( 'requires_approval', $meta['annotations'] );
 	}
 
+	/** SA#83: an empty parameter map must serialise as {} — a consumer typing it as an object rejected the whole fleet listing (Aura#482). */
+	public function test_empty_parameter_map_serialises_as_an_object(): void {
+		require_once SA_PLUGIN_DIR . '/includes/tools/class-tool-audit-mcp-exposure.php';
+		$meta = ( new Aura_Tool_Audit_Mcp_Exposure() )->get_metadata();
+		$json = json_encode( $meta );
+
+		$this->assertStringContainsString( '"parameters":{}', $json );
+		$this->assertInstanceOf( stdClass::class, $meta['parameters'] );
+		// Non-empty maps are untouched: the fake tool declares `target`.
+		$fake = ( new SA_Fake_Tool() )->get_metadata();
+		$this->assertIsArray( $fake['parameters'] );
+		$this->assertArrayHasKey( 'target', $fake['parameters'] );
+		// annotations always carry four flags — never empty, never a list.
+		$this->assertStringContainsString( '"annotations":{"read_only"', $json );
+	}
+
 	public function test_dry_run_defaults_to_null(): void {
 		$this->assertNull( ( new SA_Fake_Tool() )->dry_run( array( 'target' => 'x' ) ) );
 	}
