@@ -329,7 +329,10 @@ class Aura_Worker_Updater {
 		// (Codex #91 round-3 P1). Stop here and say so; the successor's own
 		// verdict and rollback govern the outcome.
 		if ( ! $this->keep_self_update_claim( $fence ) ) {
-			return $this->self_update_claim_lost_after_install( $backup_path, ! is_wp_error( $result ) && false !== $result );
+			// `installed` is a claim about what happened, so only a result that
+			// IS success counts: WP_Error, false and null (an upgrader that never
+			// reached its install step) are all "not proven" (Codex #94 round-1 P2).
+			return $this->self_update_claim_lost_after_install( $backup_path, ! is_wp_error( $result ) && false !== $result && null !== $result );
 		}
 
 		// A FAILED install is the case that most needs the backup: `install()`

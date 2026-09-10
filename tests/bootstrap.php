@@ -1674,7 +1674,8 @@ if ( ! class_exists( 'Plugin_Upgrader' ) ) {
 			if ( isset( $GLOBALS['_install_effect'] ) && is_callable( $GLOBALS['_install_effect'] ) ) {
 				call_user_func( $GLOBALS['_install_effect'] );
 			}
-			return $GLOBALS['_install_result'] ?? true;
+			// array_key_exists, not ??: a test may set null to model an upgrader that never reached its install step.
+			return array_key_exists( '_install_result', $GLOBALS ) ? $GLOBALS['_install_result'] : true;
 		}
 	}
 }

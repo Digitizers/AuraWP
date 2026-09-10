@@ -781,6 +781,25 @@ final class SnapshotsTest extends TestCase {
 		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
 	}
 
+	public function test_a_staged_file_whose_mode_cannot_be_set_is_never_published(): void {
+		// Codex #94 round-1 P1: a mode that could not be set is a refusal, never
+		// a publish with whatever fopen() and the umask left behind.
+		$file  = WP_CONTENT_DIR . '/nochmod.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function secure_stage( $tmp ) {
+				return false;
+			}
+		};
+
+		$res = $snaps->create_file( $file, "x\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'permissions', $res['error'] );
+		$this->assertFileDoesNotExist( $file, 'nothing at the target' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ), 'the stage is discarded' );
+		$this->assertSame( array(), $snaps->list_snapshots(), 'no record for a create that did not happen' );
+	}
+
 	public function test_link_refused_is_unsupported_filesystem_with_nothing_at_the_target(): void {
 		$file  = WP_CONTENT_DIR . '/nolink.php';
 		$snaps = new class extends Aura_Worker_Snapshots {

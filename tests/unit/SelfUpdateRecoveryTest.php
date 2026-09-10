@@ -1007,6 +1007,26 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertSame( array(), array_filter( $GLOBALS['_filters']['upgrader_pre_install'] ?? array() ), 'the heartbeat filter is removed after the phase' );
 	}
 
+	public function test_a_seized_claim_after_a_null_install_result_reports_installed_false(): void {
+		// Codex #94 round-1 P2: `installed` is a claim, and an upgrader that
+		// answered null never proved it installed anything.
+		$GLOBALS['_install_result'] = null;
+		$GLOBALS['_install_effect'] = function () {
+			$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+			$fence = substr( $held, 0, strpos( $held, '|' ) );
+			update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+			$this->assertNotSame( '', Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS ) );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['in_progress'] );
+		$this->assertFalse( $res['installed'], 'null is not proof of an install' );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertFalse( $res['health_checked'] );
+	}
+
 	public function test_a_self_update_whose_claim_was_seized_during_install_neither_restores_nor_probes(): void {
 		// Codex #91 round-3 P1: after install() the shipped code renewed the
 		// lease and carried on "because the rollback is still owed". A lost

@@ -345,13 +345,19 @@ class Aura_Worker_Snapshots {
 		}
 		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 
-		// fopen() takes the process umask, which on some hosts is group- or
-		// world-writable. link() preserves the mode, so whatever is set here is
-		// what the published target ends up with.
-		chmod( $tmp, defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_chmod -- $wp_filesystem is not initialised on this path, and the mode of a file this call exclusively created is not a filesystem abstraction concern.
-
 		if ( $written !== $len || ! $flushed ) {
 			return $this->discard_short_stage( $tmp );
+		}
+
+		// fopen() takes the process umask, which on some hosts is group- or
+		// world-writable. link() preserves the mode, so whatever is set here is
+		// what the published target ends up with — and a mode that could not be
+		// set is a refusal, never a publish with whatever fopen() left (Codex
+		// #94 round-1 P1): nothing is staged, nothing is recorded, nothing at
+		// the target.
+		if ( ! $this->secure_stage( $tmp ) ) {
+			$this->discard_stage( $tmp );
+			return array( 'success' => false, 'error' => 'Unable to set permissions on the staged file: ' . $tmp );
 		}
 		return $tmp;
 	}
@@ -365,6 +371,23 @@ class Aura_Worker_Snapshots {
 	protected function discard_short_stage( $tmp ) {
 		$this->discard_stage( $tmp );
 		return array( 'success' => false, 'error' => 'Short write while staging (disk full?): ' . $tmp );
+	}
+
+	/**
+	 * Set the staged file's mode to what the published target must carry.
+	 * False when chmod() is unavailable on this host or refuses — the caller
+	 * then discards the stage rather than publishing an unsecured file.
+	 *
+	 * Protected so a test can model a host where the mode cannot be set.
+	 *
+	 * @param string $tmp Staged path.
+	 * @return bool
+	 */
+	protected function secure_stage( $tmp ) {
+		if ( ! function_exists( 'chmod' ) ) {
+			return false;
+		}
+		return (bool) @chmod( $tmp, defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_chmod -- A refusal is an answer this method returns, not a warning to surface; $wp_filesystem is not initialised on this path, and the mode of a file this call exclusively created is not a filesystem abstraction concern.
 	}
 
 	/**
