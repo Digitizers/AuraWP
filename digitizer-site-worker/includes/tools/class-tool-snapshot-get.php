@@ -72,7 +72,7 @@ class Aura_Tool_Snapshot_Get extends Aura_Tool_Base {
 	public function get_returns() {
 		return array(
 			'found'     => 'bool — whether a snapshot with this id exists on this site',
-			'record'    => 'object|null — the stored envelope (kind, target/targets, door metadata, …), never including payload_path; null when not found',
+			'record'    => 'object|null — the stored envelope (kind, target/targets, door metadata, …), never including payload_path, never including staged; null when not found',
 			'payload'   => 'string|null — the raw payload, base64-encoded, when it is at most 2 MiB; null when the snapshot has no payload, could not be read, or was withheld',
 			'truncated' => 'bool — present and true only when the payload exceeds 2 MiB and was withheld',
 			'withheld'  => 'bool — present and true only when the payload is deliberately not returned: this envelope is not a door capture (its door_kind is not one of page|component|design_system|creation|creation_restore), or it belongs to another blog (see foreign_blog). The record is still described',
@@ -112,6 +112,7 @@ class Aura_Tool_Snapshot_Get extends Aura_Tool_Base {
 
 		$payload_path = isset( $record['payload_path'] ) ? (string) $record['payload_path'] : '';
 		unset( $record['payload_path'] );
+		unset( $record['staged'] ); // a local filesystem path, like payload_path — never returned
 
 		// ANOTHER BLOG'S CAPTURE (Ruling P15). Every blog on a multisite
 		// shares one snapshots directory and the ids are listed, so without
