@@ -790,7 +790,8 @@ final class SelfUpdateRecoveryTest extends TestCase {
 
 		$res = $this->selfUpdate();
 
-		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['in_progress'], 'the outlived request stops; the successor owns the files' );
 		$this->assertStringStartsWith( $successor . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the outlived request removed its successor\'s claim' );
 	}
 
@@ -909,5 +910,160 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertTrue( $res['success'], $res['error'] ?? '' );
 		$this->assertSame( 'OLD BUILD', $this->onDisk() );
 		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the guarded restore releases what it took' );
+	}
+
+	public function test_a_batch_entry_for_siteagent_that_outlives_its_lease_stops_before_the_health_check(): void {
+		// SA#80: the generic batch entry ran backup → update → health → rollback
+		// under a claim it never renewed. Model the update phase running past the
+		// takeover window and a successor seizing the claim: the entry must stop
+		// there — no health check, no rollback over the successor's files — and
+		// must not remove the successor's claim on its way out.
+		$successor = '';
+		$updater   = new class( $successor ) extends Aura_Worker_Updater {
+			private $successor;
+			public function __construct( &$successor ) { $this->successor = &$successor; }
+			protected function update_single_plugin( $plugin_file ) {
+				$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				$fence = substr( $held, 0, strpos( $held, '|' ) );
+				update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+				$this->successor = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+				return array( 'success' => true );
+			}
+		};
+
+		$out = $updater->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE ), 5, false );
+
+		$entry = $out['results'][0];
+		$this->assertSame( 'failed', $entry['status'] );
+		$this->assertStringContainsString( 'Lost the self-update claim', $entry['detail'] );
+		$this->assertNotSame( '', $successor, 'the aged claim must be seizable' );
+		$this->assertStringStartsWith( $successor . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the outlived entry must not remove its successor\'s claim' );
+		$this->assertSame( array(), array_filter( $GLOBALS['_wp_http_calls'] ), 'no health probe after the claim was lost' );
+	}
+
+	public function test_a_batch_entry_for_siteagent_renews_its_lease_between_phases(): void {
+		// The lease is renewed after the backup and after the update, so a slow
+		// phase is never mistaken for a dead holder. Observable as the claim's
+		// timestamp moving forward across the entry.
+		$stamps  = array();
+		$updater = new class( $stamps ) extends Aura_Worker_Updater {
+			private $stamps;
+			public function __construct( &$stamps ) { $this->stamps = &$stamps; }
+			protected function update_single_plugin( $plugin_file ) {
+				// Age the lease by a minute inside the phase; the renewal after
+				// this phase must bring it back to "now".
+				$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				$fence = substr( $held, 0, strpos( $held, '|' ) );
+				update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - MINUTE_IN_SECONDS ) );
+				$this->stamps['aged'] = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				return array( 'success' => true );
+			}
+			protected function batch_update_one( $plugin_file, $rollback, $health, $create_backup, $fence = '' ) {
+				$entry                   = parent::batch_update_one( $plugin_file, $rollback, $health, $create_backup, $fence );
+				$this->stamps['renewed'] = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				return $entry;
+			}
+		};
+
+		$out = $updater->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE ), 5, false );
+
+		$this->assertSame( 'updated', $out['results'][0]['status'], $out['results'][0]['detail'] );
+		$aged    = (int) substr( $stamps['aged'], strpos( $stamps['aged'], '|' ) + 1 );
+		$renewed = (int) substr( $stamps['renewed'], strpos( $stamps['renewed'], '|' ) + 1 );
+		$this->assertGreaterThan( $aged, $renewed, 'the lease was renewed after the update phase' );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'released on exit' );
+	}
+
+	public function test_the_lease_is_heartbeaten_inside_the_update_phase_through_the_upgraders_filters(): void {
+		// Codex #91 round-2 P1: renewing only BETWEEN phases leaves a phase
+		// that runs past the window seizable. The upgrader fires its own
+		// sub-phase filters (download → source selection → pre-install →
+		// post-install); a throttled heartbeat hooked on them keeps the lease
+		// alive while the phase runs. Modelled: the phase ages the lease, then
+		// fires a sub-phase filter; the lease must be fresh again after it.
+		$stamps  = array();
+		$updater = new class( $stamps ) extends Aura_Worker_Updater {
+			const LEASE_HEARTBEAT_SECONDS = 0; // no throttle in the model
+			private $stamps;
+			public function __construct( &$stamps ) { $this->stamps = &$stamps; }
+			protected function update_single_plugin( $plugin_file ) {
+				$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				$fence = substr( $held, 0, strpos( $held, '|' ) );
+				update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 5 * MINUTE_IN_SECONDS ) );
+				$this->stamps['aged'] = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				apply_filters( 'upgrader_pre_install', true, array() ); // what Plugin_Upgrader fires mid-phase
+				$this->stamps['beat'] = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				return array( 'success' => true );
+			}
+		};
+
+		$out = $updater->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE ), 5, false );
+
+		$this->assertSame( 'updated', $out['results'][0]['status'], $out['results'][0]['detail'] );
+		$aged = (int) substr( $stamps['aged'], strpos( $stamps['aged'], '|' ) + 1 );
+		$beat = (int) substr( $stamps['beat'], strpos( $stamps['beat'], '|' ) + 1 );
+		$this->assertGreaterThan( $aged, $beat, 'the sub-phase filter renewed the lease inside the phase' );
+		$this->assertSame( array(), array_filter( $GLOBALS['_filters']['upgrader_pre_install'] ?? array() ), 'the heartbeat filter is removed after the phase' );
+	}
+
+	public function test_a_self_update_whose_claim_was_seized_during_install_neither_restores_nor_probes(): void {
+		// Codex #91 round-3 P1: after install() the shipped code renewed the
+		// lease and carried on "because the rollback is still owed". A lost
+		// lease there means a SUCCESSOR self-update owns the directory now —
+		// restoring our backup or rolling back on our verdict overwrites its
+		// work. The request stops, says so, and leaves the successor's claim.
+		$successor = '';
+		$GLOBALS['_install_effect'] = function () use ( &$successor ) {
+			$this->installNewBuild( true );
+			$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+			$fence = substr( $held, 0, strpos( $held, '|' ) );
+			update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+			$successor = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+			$this->assertNotSame( '', $successor );
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['in_progress'] );
+		$this->assertTrue( $res['installed'] );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertFalse( $res['health_checked'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk(), 'no restore over the successor\'s directory' );
+		$this->assertSame( array(), $GLOBALS['_wp_http_calls'], 'no probe: the verdict is the successor\'s to run' );
+		$this->assertNull( get_option( 'aura_worker_boot_nonce', null ), 'no nonce armed for a probe that will not run' );
+		$this->assertStringStartsWith( $successor . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the successor\'s claim is untouched' );
+	}
+
+	public function test_a_batch_entry_for_another_plugin_takes_no_claim_and_renews_nothing(): void {
+		$out = ( new Aura_Worker_Updater() )->batch_update_plugins( array( 'akismet/akismet.php' ), 5, false );
+		$this->assertSame( 'updated', $out['results'][0]['status'] );
+		$this->assertNull( sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ) );
+	}
+
+	public function test_a_guarded_rollback_that_lost_its_lease_does_not_restore(): void {
+		if ( ! class_exists( 'Aura_Worker_Rollback' ) ) {
+			require_once dirname( __DIR__, 2 ) . '/digitizer-site-worker/includes/class-aura-worker-rollback.php';
+		}
+		$rollback = new Aura_Worker_Rollback();
+		$backup   = $rollback->backup_plugin( $this->slug );
+		$this->assertTrue( $backup['success'], $backup['error'] ?? '' );
+		file_put_contents( $this->dir . '/digitizer-site-worker.php', $this->build( 'NEW BUILD', '9.9.9' ) );
+
+		// The renewal happens right before restore_plugin() is called, so the
+		// claim is aged and seized in the seam between take_claim and that renewal:
+		$updater = new class extends Aura_Worker_Updater {
+			protected function before_guarded_restore( $fence ) {
+				// Age the claim past the takeover window and let a successor seize it.
+				update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+				Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+			}
+		};
+
+		$res = $updater->restore_plugin_guarded( $rollback, $this->slug, $backup['backup_path'] );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['in_progress'] );
+		$this->assertStringContainsString( 'NEW BUILD', file_get_contents( $this->dir . '/digitizer-site-worker.php' ), 'nothing restored after the claim was lost' );
 	}
 }
