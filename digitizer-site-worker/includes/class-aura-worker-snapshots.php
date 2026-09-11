@@ -281,6 +281,18 @@ class Aura_Worker_Snapshots {
 
 		// 3. Publish: atomic, no-clobber.
 		$published = $this->publish( $tmp, $path );
+		if ( 'partial' === $published ) {
+			// Partial bytes sit at the target and could not be emptied (Codex
+			// #97 round-3 P2). The record is voided in place and marked
+			// interrupted — restore can never delete that file — and the stage
+			// is KEPT: it is the reconciler's signal and the operator's copy of
+			// what should have landed. Nothing is discarded that a repair needs.
+			$out = array( 'success' => false, 'error' => 'unsupported_filesystem', 'detail' => $this->last_publish_detail, 'stale_record' => $record['id'] );
+			if ( $this->void_record_in_place( $record['id'], array( 'interrupted' => true ) ) ) {
+				$out['detail'] .= '; record ' . $record['id'] . ' voided and marked interrupted, staged bytes kept at ' . $tmp;
+			}
+			return $out;
+		}
 		if ( true !== $published ) {
 			$out = $this->abandon_create( $tmp, $record['id'], (string) $published );
 			if ( isset( $this->last_publish_detail ) && '' !== $this->last_publish_detail ) {
@@ -294,15 +306,33 @@ class Aura_Worker_Snapshots {
 		// and prune_older_than() remove what is left.
 		$this->discard_stage( $tmp );
 
+		// A publish that ran past STAGE_MAX_AGE (a large file on slow storage)
+		// looks interrupted to a concurrent sweep, which voids the record while
+		// we are still writing (Codex #97 round-5 P2). The bytes landed and the
+		// inode was verified, so the truth is ours to restore: put the hash
+		// back and lift the void. If even that fails the create still happened
+		// — say so instead of pretending it did not.
+		$out     = array( 'success' => true, 'published' => $this->last_publish_mode );
+		$current = $this->get( $record['id'] );
+		if ( is_array( $current ) && ! empty( $current['voided'] ) ) {
+			if ( ! $this->reinstate_record( $record['id'], $sha ) ) {
+				$out['warning'] = 'the record was voided by a concurrent sweep during a long publish and could not be repaired; restore will refuse it';
+			}
+		}
+
 		// The PERSISTED record keeps `staged` — prune_older_than()'s sweep reads
 		// it from list_snapshots() — but the RETURNED one carries no local path
 		// at all (Codex #94 round-6 P3): step 4 deleted the staged file, and
 		// `meta_path` is this site's directory, not a fact about the snapshot.
-		return array( 'success' => true, 'snapshot' => self::redact( $record ) );
+		$out['snapshot'] = self::redact( $record );
+		return $out;
 	}
 
 	/** The last publish() failure's PHP message, for the caller's `detail`. */
 	private $last_publish_detail = '';
+
+	/** How the last publish() landed: 'link' or 'rename'; '' when it did not. */
+	private $last_publish_mode = '';
 
 	/**
 	 * Write the complete content to a temporary file this call owns, beside
@@ -401,29 +431,39 @@ class Aura_Worker_Snapshots {
 	}
 
 	/**
-	 * Publish the staged bytes at the target with link(): atomic, and it
-	 * refuses to clobber. rename() clobbers and is not a substitute.
+	 * Publish the staged bytes at the target: no-clobber, and never a partial
+	 * file where it can be avoided. With link() that is one atomic call.
+	 * Where link() is disabled (most managed hosts put it in disable_functions
+	 * for web PHP — Cloudways does, SiteAgent#96) the target is CLAIMED with
+	 * fopen( 'xb' ) — it refuses an existing path and hands back an inode this
+	 * call owns — and the bytes are written INTO that handle. Ownership is by
+	 * inode, not by pathname: a racer can unlink our entry, never be
+	 * overwritten by us, and the write is verified against the entry's inode
+	 * before it is called published. What the link()-less publish gives up is
+	 * the empty→complete jump: a reader in the milliseconds of the write can
+	 * see a growing file. rename() is NOT a substitute for either: it
+	 * clobbers whatever holds the path when it runs (Codex #97 round-1 P1).
 	 *
 	 * Protected so a test can model a race (the target appears first) or a
 	 * filesystem that refuses hard links.
 	 *
 	 * @param string $tmp  Staged path.
 	 * @param string $path Target path.
-	 * @return true|string true, 'exists' (the target was there first), or
-	 *                     'unsupported_filesystem' (link() refused; nothing written).
+	 * @return true|string true, 'exists' (the target was there first),
+	 *                     'unsupported_filesystem' (the publish could not land; see `detail`),
+	 *                     or 'partial' (link()-less only: a short write whose partial
+	 *                     bytes could not be emptied — the caller keeps recovery state).
 	 */
 	protected function publish( $tmp, $path ) {
 		$this->last_publish_detail = '';
-		// Fail closed, and SAY so: a host with link() in disable_functions makes
-		// the call warn and return null, which would otherwise be classified
-		// below as an ordinary refusal with no message to explain it.
+		$this->last_publish_mode   = '';
 		if ( ! $this->link_available() ) {
-			$this->last_publish_detail = 'link() is disabled on this host';
-			return 'unsupported_filesystem';
+			return $this->publish_by_write( $tmp, $path );
 		}
 		error_clear_last();
 		$ok = @link( $tmp, $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is an expected answer, not a warning to surface; it is classified below.
 		if ( $ok ) {
+			$this->last_publish_mode = 'link';
 			return true;
 		}
 		$err                       = error_get_last();
@@ -437,6 +477,178 @@ class Aura_Worker_Snapshots {
 		// Any other refusal: the filesystem cannot give us an atomic, no-clobber
 		// publish. Fail closed — nothing was written at the target.
 		return 'unsupported_filesystem';
+	}
+
+	/**
+	 * The link()-less publish: exclusive-create the target and write the
+	 * staged bytes into the handle we own. See publish().
+	 *
+	 * @param string $tmp  Staged path.
+	 * @param string $path Target path.
+	 * @return true|string As publish().
+	 */
+	private function publish_by_write( $tmp, $path ) {
+		$mode = $this->create_mode();
+		if ( 0 !== ( $mode & 0111 ) ) {
+			// fopen() creates from 0666 and a umask only removes bits: a site whose
+			// FS_CHMOD_FILE carries execute bits (0755 hosts exist) would get a
+			// silently lesser file. Refuse, as the put-back does (Codex #97 round-5).
+			$this->last_publish_detail = sprintf( 'link() is disabled on this host and FS_CHMOD_FILE (%o) has execute bits that fopen() cannot recreate', $mode );
+			return 'unsupported_filesystem';
+		}
+		$src = @fopen( $tmp, 'rb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Our own staged file; a refusal is answered below.
+		if ( false === $src ) {
+			$this->last_publish_detail = 'the staged bytes could not be read back';
+			return 'unsupported_filesystem';
+		}
+		$landed = $this->write_exclusively( $path, $src );
+		fclose( $src ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		if ( true === $landed ) {
+			$this->last_publish_mode = 'write';
+			return true;
+		}
+		if ( 'exists' === $landed || 'partial' === $landed ) {
+			return $landed;
+		}
+		$this->last_publish_detail = 'link() is disabled on this host and ' . $landed;
+		return 'unsupported_filesystem';
+	}
+
+	/**
+	 * Create $path exclusively and stream $src into it — the one primitive
+	 * behind the link()-less publish and put-back. fopen( 'xb' ) refuses an
+	 * existing path (no clobber, ever) and returns an inode this call owns;
+	 * after the write the directory entry is re-read and must still be that
+	 * inode, or the bytes went to an entry a racer already unlinked and the
+	 * path is not ours to report on. Nothing here ever addresses the path by
+	 * name once it is claimed — not even for the mode, which is set at
+	 * creation through the process umask (PHP exposes no fchmod(); a chmod()
+	 * by pathname could dress a racer's replacement file — Codex #97 round-2).
+	 *
+	 * @param string   $path Target path.
+	 * @param resource $src  Readable handle with the bytes.
+	 * @param int|null $mode Mode for the new entry; null = FS_CHMOD_FILE (0644).
+	 *                       fopen() creates from a base of 0666 and a umask can only
+	 *                       REMOVE bits, so execute bits cannot be produced here: a
+	 *                       fresh create lands with `mode & 0666`, and a caller that
+	 *                       must keep execute bits refuses before calling (put-back).
+	 * @return true|string true; 'exists' (the path was taken — before the claim,
+	 *                     or by a racer who unlinked our entry and took it during
+	 *                     the write); 'partial' (the write was short AND the entry
+	 *                     could not be emptied — partial bytes remain at the path
+	 *                     and the caller must keep its recovery state); or a
+	 *                     sentence saying what refused. On a short write that
+	 *                     could be emptied our own entry is left EMPTY at the path
+	 *                     (truncated, never unlinked by pathname) and the sentence
+	 *                     names it. `last_publish_detail` carries the sentence for
+	 *                     'partial' too.
+	 */
+	private function write_exclusively( $path, $src, $mode = null ) {
+		$mode = ( null === $mode ? $this->create_mode() : (int) $mode ) & 0666; // callers refuse execute bits before reaching here
+		$was  = umask( 0777 & ~$mode ); // the mode is decided AT creation, on our inode only
+		$fh   = @fopen( $path, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- 'x' is the no-clobber claim; EEXIST is the expected refusal, classified below.
+		umask( $was );
+		if ( false === $fh ) {
+			return self::path_present( $path ) ? 'exists' : 'the target could not be claimed';
+		}
+		$mine    = fstat( $fh );
+		$written = $this->write_all( $fh, $src );
+		$synced  = $written && fflush( $fh ) && ( function_exists( 'fsync' ) ? (bool) fsync( $fh ) : true );
+		$this->during_write( $path );
+		$now        = @stat( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- The entry may be gone; that is an answer.
+		$still_ours = is_array( $mine ) && is_array( $now ) && $now['ino'] === $mine['ino'] && $now['dev'] === $mine['dev'];
+		if ( ! $written || ! $synced ) {
+			// Our inode, our bytes, incomplete: empty it rather than leave a
+			// truncated file that reads as content. The empty entry stays — it
+			// is removed only by inode-verified paths, never by name. When even
+			// the emptying is refused, the partial bytes are a fact the caller
+			// must keep recovery state for (Codex #97 round-3 P2).
+			$emptied = $this->truncate_to_empty( $fh );
+			fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+			if ( ! $emptied ) {
+				$this->last_publish_detail = 'the write into the claimed target was short and the entry could not be emptied' . ( $still_ours ? '; partial bytes remain at ' . $path : '' );
+				return 'partial';
+			}
+			return 'the write into the claimed target was short' . ( $still_ours ? '; an empty file remains at ' . $path : '' );
+		}
+		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		if ( ! $still_ours ) {
+			// The entry we created was unlinked (and maybe replaced) while we
+			// wrote: our bytes are in an inode nobody can reach, and whatever
+			// holds the path now was not touched by us.
+			return self::path_present( $path ) ? 'exists' : 'the target was removed during the write';
+		}
+		return true;
+	}
+
+	/**
+	 * Empty our own inode after a short write. Seam: a test models a
+	 * filesystem that refuses the truncation.
+	 *
+	 * @param resource $fh Open handle we own.
+	 * @return bool
+	 */
+	protected function truncate_to_empty( $fh ) {
+		return (bool) ftruncate( $fh, 0 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_ftruncate
+	}
+
+	/**
+	 * The mode a fresh create should carry: FS_CHMOD_FILE, or 0644 without it.
+	 * Seam: a test models a host that configures execute bits.
+	 *
+	 * @return int
+	 */
+	protected function create_mode() {
+		return defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644;
+	}
+
+	/**
+	 * Copy $src into $fh, chunk by chunk, or say so. Bounded memory whatever
+	 * the size (a changed file put back on restore can be anything the site
+	 * grew it to — Codex #97 round-2 P2). Seam: a test models a short write.
+	 *
+	 * @param resource $fh  Open destination handle.
+	 * @param resource $src Open readable source handle.
+	 * @return bool
+	 */
+	protected function write_all( $fh, $src ) {
+		while ( ! feof( $src ) ) {
+			$chunk = fread( $src, 65536 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+			if ( false === $chunk ) {
+				return false;
+			}
+			$len = strlen( $chunk );
+			$off = 0;
+			while ( $off < $len ) {
+				$n = fwrite( $fh, substr( $chunk, $off ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite
+				if ( false === $n || 0 === $n ) {
+					return false;
+				}
+				$off += $n;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Seam between the write and the ownership check. Nothing in production;
+	 * a test models a racer acting on the pathname here.
+	 *
+	 * @param string $path Target path.
+	 */
+	protected function during_write( $path ) {
+	}
+
+	/**
+	 * How a create publishes on this host: 'link' (one atomic hard link) or
+	 * 'write' (exclusive create, bytes written into the owned handle — a
+	 * reader can see the file grow). Reported by audit_agent_code so the
+	 * fleet knows which sites create with the empty→complete jump.
+	 *
+	 * @return string
+	 */
+	public static function publish_mode() {
+		return function_exists( 'link' ) ? 'link' : 'write';
 	}
 
 	/**
@@ -492,7 +704,7 @@ class Aura_Worker_Snapshots {
 	 *
 	 * @param string $tmp Staged path.
 	 */
-	private function discard_stage( $tmp ) {
+	protected function discard_stage( $tmp ) {
 		if ( is_string( $tmp ) && '' !== $tmp && file_exists( $tmp ) ) {
 			wp_delete_file( $tmp );
 		}
@@ -548,17 +760,59 @@ class Aura_Worker_Snapshots {
 		if ( ! file_exists( $meta_path ) ) {
 			return true;
 		}
-		$record = $this->get( $id );
+		return $this->void_record_in_place( $id );
+	}
+
+	/**
+	 * Rewrite a record without `expected_sha256` and `staged`, with
+	 * `voided: true` (plus $extra), so restore_created_file() answers
+	 * "carries no expected hash" instead of deleting whatever holds the target.
+	 *
+	 * @param string $id    Snapshot id.
+	 * @param array  $extra Extra keys to stamp (e.g. `interrupted`).
+	 * @return bool True when the record is voided (or undecodable — restore
+	 *              cannot act on that either); false when the rewrite failed.
+	 */
+	protected function void_record_in_place( $id, array $extra = array() ) {
+		$meta_path = $this->dir . basename( (string) $id ) . '.json';
+		$record    = $this->get( $id );
 		if ( ! is_array( $record ) ) {
 			return true; // undecodable: restore cannot act on it either
 		}
 		unset( $record['expected_sha256'], $record['staged'] );
 		$record['voided'] = true;
+		foreach ( $extra as $k => $v ) {
+			$record[ $k ] = $v;
+		}
 		$json = wp_json_encode( $record );
 		if ( false === $json ) {
 			return false;
 		}
 		$n = @file_put_contents( $meta_path, $json ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- The record file this class owns; a refusal is answered to the caller, not surfaced as a warning.
+		return false !== $n && $n === strlen( $json ) && $this->sync_file( $meta_path );
+	}
+
+	/**
+	 * Lift a void a concurrent sweep put on a record whose publish did land:
+	 * the expected hash goes back, `voided` and `interrupted` go.
+	 *
+	 * @param string $id  Snapshot id.
+	 * @param string $sha The published content's sha256.
+	 * @return bool
+	 */
+	private function reinstate_record( $id, $sha ) {
+		$meta_path = $this->dir . basename( (string) $id ) . '.json';
+		$record    = $this->get( $id );
+		if ( ! is_array( $record ) ) {
+			return false;
+		}
+		unset( $record['voided'], $record['interrupted'] );
+		$record['expected_sha256'] = $sha;
+		$json                      = wp_json_encode( $record );
+		if ( false === $json ) {
+			return false;
+		}
+		$n = @file_put_contents( $meta_path, $json ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- The record file this class owns; a refusal is answered to the caller.
 		return false !== $n && $n === strlen( $json ) && $this->sync_file( $meta_path );
 	}
 
@@ -591,6 +845,57 @@ class Aura_Worker_Snapshots {
 	}
 
 	/**
+	 * The record that names this staged file, if any (a create that died
+	 * between its record and its publish). Reads the records only when an
+	 * over-age stage is actually found, which is rare.
+	 *
+	 * @param string $staged Staged path.
+	 * @return array|null
+	 */
+	private function record_for_stage( $staged ) {
+		foreach ( $this->list_snapshots() as $rec ) {
+			if ( 'file' === ( $rec['kind'] ?? '' ) && ( $rec['staged'] ?? null ) === $staged ) {
+				return $rec;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * A stage that outlived its hour means the publish never finished. If the
+	 * target holds the expected bytes the publish DID land and only the stage
+	 * cleanup failed — the record stays restorable. If the target holds other
+	 * bytes, either the link()-less write was interrupted (an empty or
+	 * partial file this create left) or something else took the path after we
+	 * died; the record is VOIDED so a restore can never delete that file,
+	 * and marked `interrupted` so the listing says why (Codex #97 round-1 P1).
+	 * An absent target needs nothing: restore on the record is "already gone".
+	 *
+	 * The stage is the signal that reconciliation is still owed: when the
+	 * record could not be voided (snapshot directory unwritable, disk full)
+	 * the stage must STAY so the next sweep tries again — deleting it would
+	 * leave the record restorable for good (Codex #97 round-2 P2).
+	 *
+	 * @param array|null $rec The record naming the stage, or null.
+	 * @return bool True when the stage may be deleted.
+	 */
+	protected function reconcile_stage( $rec ) {
+		if ( ! is_array( $rec ) || empty( $rec['id'] ) ) {
+			return true;
+		}
+		$target   = (string) ( $rec['target'] ?? '' );
+		$expected = (string) ( $rec['expected_sha256'] ?? '' );
+		if ( '' === $target || '' === $expected || ! is_file( $target ) ) {
+			return true;
+		}
+		$actual = hash_file( 'sha256', $target );
+		if ( is_string( $actual ) && hash_equals( $expected, $actual ) ) {
+			return true; // published; only the stage cleanup was lost
+		}
+		return $this->void_record_in_place( (string) $rec['id'], array( 'interrupted' => true ) );
+	}
+
+	/**
 	 * Remove `.aura-create-*` leftovers older than STAGE_MAX_AGE in one
 	 * directory — a crash between staging and the record leaves a stray that
 	 * no record names, and the next create in that directory is the one
@@ -616,7 +921,9 @@ class Aura_Worker_Snapshots {
 			}
 			$at = filemtime( $stray );
 			if ( false !== $at && $at < $cut ) {
-				wp_delete_file( $stray );
+				if ( $this->reconcile_stage( $this->record_for_stage( $stray ) ) ) {
+					wp_delete_file( $stray );
+				}
 			}
 		}
 	}
@@ -979,19 +1286,61 @@ class Aura_Worker_Snapshots {
 		// path is taken — the changed file stays beside it under its claim name
 		// and the answer says where. Nothing is ever deleted on this branch.
 		$out = array( 'success' => false, 'error' => 'file_changed_since' );
-		// A host without link() takes the moved_aside branch outright: nothing is
-		// attempted at the target and, as on every path here, nothing is deleted.
-		if ( $this->link_available() && @link( $claim, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is the expected refusal, classified below.
-			wp_delete_file( $claim ); // the second name to the same inode; the file is back at its path
-			if ( file_exists( $claim ) ) {
-				// The file is back, but its claim name could not be removed and
-				// `.aura-restore-*` is never swept: say where it is, as the
-				// matching-hash branch does (Codex #94 round-7 P2).
+		if ( $this->link_available() ) {
+			if ( @link( $claim, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is the expected refusal, classified below.
+				wp_delete_file( $claim ); // the second name to the same inode; the file is back at its path
+				if ( file_exists( $claim ) ) {
+					// The file is back, but its claim name could not be removed and
+					// `.aura-restore-*` is never swept: say where it is, as the
+					// matching-hash branch does (Codex #94 round-7 P2).
+					$out['moved_aside'] = $claim;
+				}
+			} else {
 				$out['moved_aside'] = $claim;
 			}
-		} else {
+			return $out;
+		}
+		// A host without link() (SiteAgent#96) puts the file back the way
+		// publish() lands one: exclusive-create the path and write the claimed
+		// bytes into the handle we own — no clobber, ever. A refused claim
+		// means the path is taken; a refused write leaves our empty entry there.
+		// Either way the changed file stays aside and the answer says where.
+		if ( true !== $this->put_back_by_write( $claim, $target ) ) {
+			$out['moved_aside'] = $claim;
+			return $out;
+		}
+		wp_delete_file( $claim ); // the bytes are back at their path; the claim copy goes
+		if ( file_exists( $claim ) ) {
 			$out['moved_aside'] = $claim;
 		}
+		return $out;
+	}
+
+	/**
+	 * The link()-less put-back: exclusive-create the target and stream the
+	 * claimed file into it. See write_exclusively().
+	 *
+	 * @param string $claim  The claimed (renamed) file.
+	 * @param string $target The original path.
+	 * @return true|string true when the bytes are back at their path.
+	 */
+	private function put_back_by_write( $claim, $target ) {
+		$src = @fopen( $claim, 'rb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- The file this call holds under its claim name.
+		if ( false === $src ) {
+			return 'the claimed file could not be read';
+		}
+		$st   = fstat( $src );
+		$mode = is_array( $st ) ? ( (int) $st['mode'] & 0777 ) : null;
+		if ( null !== $mode && 0 !== ( $mode & 0111 ) ) {
+			// fopen() cannot create an executable (base 0666; a umask only removes
+			// bits) and nothing here addresses the path by name, so an executable
+			// cannot come back as it was without link(): it stays aside, named
+			// (Codex #97 round-4 P2).
+			fclose( $src ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+			return sprintf( 'the file is executable (mode %o) and that cannot be recreated without link()', $mode );
+		}
+		$out = $this->write_exclusively( $target, $src, $mode ); // the file comes back with the mode it had (Codex #97 round-3 P2)
+		fclose( $src ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 		return $out;
 	}
 
@@ -1434,7 +1783,9 @@ class Aura_Worker_Snapshots {
 				if ( is_file( $staged ) ) {
 					$at = filemtime( $staged );
 					if ( false !== $at && $at < time() - self::STAGE_MAX_AGE ) {
-						wp_delete_file( $staged );
+						if ( $this->reconcile_stage( $rec ) ) {
+							wp_delete_file( $staged );
+						}
 					}
 				}
 			}
