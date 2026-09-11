@@ -820,11 +820,16 @@ class Aura_Worker_Updater {
 	 * untouched and are removed after the phase, whatever it returns.
 	 *
 	 * A lost lease is acted on only where WordPress itself can abort cleanly:
-	 * the three pre-stage filters answer a WP_Error, which the upgrader honours
-	 * before the stage touches anything. A phase already past its last
-	 * pre-stage cannot be aborted halfway without leaving the directory
-	 * incomplete, so `upgrader_post_install` passes through and the check
-	 * after the phase (`lease_kept()`) is where that loss stops the work.
+	 * the three pre-stage filters and `upgrader_clear_destination` answer a
+	 * WP_Error, which the upgrader honours before the stage touches anything
+	 * — the last of them fires immediately before the old directory is
+	 * deleted, so the destructive step itself is fenced (Codex #94 round-8
+	 * P1). What remains unfenced is the copy after that delete: no filter
+	 * fires inside it, and a copy of this plugin runs seconds, not the
+	 * ten-minute takeover window. A phase already past its last abort point
+	 * cannot be stopped halfway without leaving the directory incomplete, so
+	 * `upgrader_post_install` passes through and the check after the phase
+	 * (`lease_kept()`) is where that loss stops the work.
 	 *
 	 * @param string   $fence The fence; '' runs $work plainly (no claim was taken).
 	 * @param callable $work  The phase.
@@ -843,11 +848,17 @@ class Aura_Worker_Updater {
 		// BEFORE the stage runs — nothing downloaded, unpacked or written — so
 		// a request whose claim was seized between two sub-phases stops at the
 		// upgrader's own abort point instead of installing beside its
-		// successor. `upgrader_post_install` fires after the files are
-		// replaced; aborting there would only mislabel a finished install, so
-		// it passes its value through and the boundary check after the phase
-		// (`lease_kept()`) is what stops the work.
-		$hooks = array( 'upgrader_pre_download', 'upgrader_source_selection', 'upgrader_pre_install', 'upgrader_post_install' );
+		// successor. `upgrader_clear_destination` is the same kind of point
+		// (Codex #94 round-8 P1): WordPress deletes the old directory INSIDE
+		// that filter (Plugin_Upgrader::delete_old_plugin at priority 10, which
+		// returns a WP_Error it receives untouched), so a beat at priority 1
+		// renews the lease right before the destructive step and a lost claim
+		// stops the phase with the old files still in place.
+		// `upgrader_post_install` fires after the files are replaced; aborting
+		// there would only mislabel a finished install, so it passes its value
+		// through and the boundary check after the phase (`lease_kept()`) is
+		// what stops the work.
+		$hooks = array( 'upgrader_pre_download', 'upgrader_source_selection', 'upgrader_pre_install', 'upgrader_clear_destination', 'upgrader_post_install' );
 		$beats = array(); // one closure per hook: the hook's name is bound, so no current_filter() lookup
 		foreach ( $hooks as $hook ) {
 			$abort          = 'upgrader_post_install' !== $hook;

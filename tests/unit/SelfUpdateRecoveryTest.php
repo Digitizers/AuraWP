@@ -1063,6 +1063,42 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertStringStartsWith( $stamps['successor'] . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the successor\'s claim is untouched' );
 	}
 
+	public function test_a_claim_seized_between_pre_install_and_the_clear_aborts_before_the_old_directory_is_deleted(): void {
+		// Codex #94 round-8 P1: the beats sat only on the pre-stages and
+		// post-install, so a claim seized after upgrader_pre_install was
+		// noticed only after the install had already cleared and rewritten
+		// the directory beside its successor. upgrader_clear_destination is
+		// WordPress's own filter immediately before the delete (the delete
+		// itself runs inside it, at priority 10); the beat at priority 1 renews
+		// there and a lost claim answers a WP_Error that stops the phase with
+		// the old files untouched.
+		$stamps  = array();
+		$updater = new class( $stamps ) extends Aura_Worker_Updater {
+			const LEASE_HEARTBEAT_SECONDS = 0;
+			private $stamps;
+			public function __construct( &$stamps ) { $this->stamps = &$stamps; }
+			protected function update_single_plugin( $plugin_file ) {
+				$this->stamps['pre'] = apply_filters( 'upgrader_pre_install', true, array() ); // still ours
+				$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				$fence = substr( $held, 0, strpos( $held, '|' ) );
+				update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) ); // the clear runs long
+				$this->stamps['successor'] = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+				$this->stamps['clear']     = apply_filters( 'upgrader_clear_destination', true, '/local', '/remote', array() );
+				return array( 'success' => true );
+			}
+		};
+
+		$out = $updater->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE ), 5, false );
+
+		$this->assertTrue( $stamps['pre'], 'pre-install passed while the claim was ours' );
+		$this->assertNotSame( '', $stamps['successor'], 'the aged claim must be seizable' );
+		$this->assertInstanceOf( WP_Error::class, $stamps['clear'], 'a lost claim aborts at the clear, before the old directory is deleted' );
+		$this->assertSame( 'aura_self_update_claim_lost', $stamps['clear']->get_error_code() );
+		$this->assertSame( 'failed', $out['results'][0]['status'] );
+		$this->assertStringContainsString( 'Lost the self-update claim', $out['results'][0]['detail'] );
+		$this->assertSame( array(), array_filter( $GLOBALS['_filters']['upgrader_clear_destination'] ?? array() ), 'the beat is removed after the phase' );
+	}
+
 	public function test_a_generic_single_update_that_loses_its_claim_during_the_phase_is_not_reported_as_success(): void {
 		// Codex #94 round-5 P2: update_plugin() had no check after its phase,
 		// so a claim seized after upgrader_pre_install (post-install passes
