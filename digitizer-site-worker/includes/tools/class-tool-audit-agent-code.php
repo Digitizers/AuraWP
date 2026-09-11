@@ -451,9 +451,10 @@ class Aura_Tool_Audit_Agent_Code extends Aura_Tool_Base {
 			'execute_php'    => (bool) $env['execute_php'],
 			'fs_write'       => (bool) $env['fs_write'],
 			'wp_cli'         => (bool) $env['wp_cli'],
-			// How a write_file CREATE lands on this host (SiteAgent#96): 'link',
-			// 'rename' (absent → empty → complete), or null when neither is
-			// callable and the Power Pack refuses to create a new file.
+			// How a write_file CREATE lands on this host (SiteAgent#96): 'link'
+			// (one atomic hard link) or 'write' (exclusive create, bytes written
+			// into the owned handle — a reader can see the file grow); null only
+			// when the engine is not loaded at all.
 			'create_publish' => $this->create_publish(),
 		);
 	}
@@ -461,7 +462,7 @@ class Aura_Tool_Audit_Agent_Code extends Aura_Tool_Base {
 	/**
 	 * Seam: the engine's publish mode on this host.
 	 *
-	 * @return string|null 'link' | 'rename' | null
+	 * @return string|null 'link' | 'write' | null
 	 */
 	protected function create_publish() {
 		return class_exists( 'Aura_Worker_Snapshots' ) && method_exists( 'Aura_Worker_Snapshots', 'publish_mode' )
