@@ -709,6 +709,54 @@ final class SnapshotsTest extends TestCase {
 		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ), 'no staged file left' );
 	}
 
+	public function test_a_lost_race_whose_record_cannot_be_unlinked_is_voided_so_it_never_restores_over_the_winner(): void {
+		// Codex #94 round-5 P2: the winner landed the SAME bytes, so a
+		// restorable orphan record would pass its hash check and delete the
+		// winner's file. When the record's unlink is refused it is voided in
+		// place instead (no expected_sha256), and restore refuses it.
+		$file  = WP_CONTENT_DIR . '/race.php';
+		$snaps = new class( $file ) extends Aura_Worker_Snapshots {
+			private $race;
+			public function __construct( $race ) { parent::__construct(); $this->race = $race; }
+			protected function publish( $tmp, $path ) {
+				file_put_contents( $this->race, "mine\n" ); // the winner wrote identical bytes first
+				$GLOBALS['_wp_delete_file_fail'] = WP_CONTENT_DIR . '/aura-backups/snapshots/' . $this->list_snapshots()[0]['id'] . '.json'; // and our record's unlink is refused
+				return parent::publish( $tmp, $path );
+			}
+		};
+
+		$res = $snaps->create_file( $file, "mine\n" );
+		unset( $GLOBALS['_wp_delete_file_fail'] );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'exists', $res['error'] );
+		$this->assertArrayNotHasKey( 'stale_record', $res, 'the record was voided, not left restorable' );
+		$recs = $snaps->list_snapshots();
+		$this->assertCount( 1, $recs );
+		$this->assertTrue( $recs[0]['voided'] );
+		$this->assertArrayNotHasKey( 'expected_sha256', $recs[0] );
+		$restore = $snaps->restore( $recs[0]['id'] );
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( "mine\n", file_get_contents( $file ), 'the winner\'s file is untouched' );
+	}
+
+	public function test_redact_strips_every_local_path_and_the_api_listing_uses_it(): void {
+		// Codex #94 round-5 P3: GET /aura/v2/snapshots returned list_snapshots()
+		// verbatim, staged included.
+		$snaps = new Aura_Worker_Snapshots();
+		$snaps->create_file( WP_CONTENT_DIR . '/r.php', "x\n" );
+		$stored = $snaps->list_snapshots()[0];
+		$this->assertArrayHasKey( 'staged', $stored, 'the persisted record keeps it for the sweep' );
+
+		$public = Aura_Worker_Snapshots::redact( $stored );
+
+		$this->assertArrayNotHasKey( 'staged', $public );
+		$this->assertArrayNotHasKey( 'meta_path', $public );
+		$this->assertArrayNotHasKey( 'payload_path', $public );
+		$this->assertSame( $stored['id'], $public['id'] );
+		$this->assertStringContainsString( "array_map( array( 'Aura_Worker_Snapshots', 'redact' ), \$snapshots->list_snapshots() )", file_get_contents( SA_PLUGIN_DIR . '/includes/class-aura-worker-api.php' ), 'the REST listing passes every record through redact()' );
+	}
+
 	public function test_target_appearing_between_stage_and_publish_is_exists_with_nothing_left_behind(): void {
 		$file  = WP_CONTENT_DIR . '/race.php';
 		$snaps = new class( $file ) extends Aura_Worker_Snapshots {

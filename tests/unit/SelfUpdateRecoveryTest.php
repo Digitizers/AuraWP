@@ -1063,6 +1063,92 @@ final class SelfUpdateRecoveryTest extends TestCase {
 		$this->assertStringStartsWith( $stamps['successor'] . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ), 'the successor\'s claim is untouched' );
 	}
 
+	public function test_a_generic_single_update_that_loses_its_claim_during_the_phase_is_not_reported_as_success(): void {
+		// Codex #94 round-5 P2: update_plugin() had no check after its phase,
+		// so a claim seized after upgrader_pre_install (post-install passes
+		// through) came back as success while the successor owned the files.
+		$successor = '';
+		$GLOBALS['_upgrade_effect'] = function () use ( &$successor ) {
+			$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+			$fence = substr( $held, 0, strpos( $held, '|' ) );
+			update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+			$successor = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		};
+		try {
+			$res = ( new Aura_Worker_Updater() )->update_plugin( Aura_Worker_Updater::SELF_PLUGIN_FILE );
+		} finally {
+			unset( $GLOBALS['_upgrade_effect'] );
+		}
+
+		$this->assertNotSame( '', $successor );
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['in_progress'], 'a successor owns the files; the outcome is its to report' );
+		$this->assertStringStartsWith( $successor . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ) );
+	}
+
+	public function test_a_batch_entry_whose_claim_is_seized_during_the_health_probe_does_not_roll_back(): void {
+		// SA#93 (closed): the probe is a loopback request; a claim lost across
+		// it means the rollback belongs to the successor.
+		$successor = '';
+		$GLOBALS['_http_response'] = array( 'response' => array( 'code' => 500 ), 'body' => '' ); // the verdict would roll back
+		$GLOBALS['_http_effect']   = function () use ( &$successor ) {
+			if ( '' !== $successor ) {
+				return;
+			}
+			$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+			$fence = substr( $held, 0, strpos( $held, '|' ) );
+			update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+			$successor = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+		};
+		$updater = new class extends Aura_Worker_Updater {
+			protected function update_single_plugin( $plugin_file ) {
+				file_put_contents( WP_PLUGIN_DIR . '/digitizer-site-worker/digitizer-site-worker.php', "<?php\n// NEW BUILD 9.9.9\n" );
+				return array( 'success' => true );
+			}
+		};
+
+		$out = $updater->batch_update_plugins( array( Aura_Worker_Updater::SELF_PLUGIN_FILE ), 5, true );
+
+		$this->assertNotSame( '', $successor, 'the claim was seized during the probe' );
+		$this->assertSame( 'failed', $out['results'][0]['status'] );
+		$this->assertStringContainsString( 'Lost the self-update claim', $out['results'][0]['detail'] );
+		$this->assertStringContainsString( 'NEW BUILD', file_get_contents( WP_PLUGIN_DIR . '/digitizer-site-worker/digitizer-site-worker.php' ), 'no rollback over the successor\'s files' );
+		$this->assertStringStartsWith( $successor . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ) );
+	}
+
+	public function test_a_self_update_whose_claim_is_seized_during_the_verdict_does_not_roll_back(): void {
+		// SA#93 (closed): same seam on the self-update path — the verdict took
+		// a loopback round trip, and a claim lost across it leaves the rollback
+		// to the successor.
+		$successor = '';
+		$GLOBALS['_install_effect'] = function () use ( &$successor ) {
+			// A build that never boots (no beacon) — the verdict would roll back —
+			// and the probe request is where the claim gets seized. Set AFTER
+			// installNewBuild(), which installs its own `_http_effect`.
+			$this->installNewBuild( false );
+			$GLOBALS['_http_effect'] = function () use ( &$successor ) {
+				if ( '' !== $successor ) {
+					return;
+				}
+				$held  = (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK );
+				$fence = substr( $held, 0, strpos( $held, '|' ) );
+				update_option( Aura_Worker_Updater::SELF_UPDATE_LOCK, $fence . '|' . ( time() - 11 * MINUTE_IN_SECONDS ) );
+				$successor = Aura_Worker_Magic_Link::take_claim( Aura_Worker_Updater::SELF_UPDATE_LOCK, 10 * MINUTE_IN_SECONDS );
+			};
+		};
+
+		$res = $this->selfUpdate();
+
+		$this->assertNotSame( '', $successor );
+		$this->assertFalse( $res['success'] );
+		$this->assertTrue( $res['in_progress'] );
+		$this->assertTrue( $res['installed'] );
+		$this->assertTrue( $res['health_checked'], 'the probe ran; its verdict is not acted on' );
+		$this->assertFalse( $res['rolled_back'] );
+		$this->assertSame( 'NEW BUILD', $this->onDisk(), 'no restore over the successor\'s directory' );
+		$this->assertStringStartsWith( $successor . '|', (string) sa_read_option_uncached( Aura_Worker_Updater::SELF_UPDATE_LOCK ) );
+	}
+
 	public function test_a_self_update_whose_claim_was_seized_during_install_neither_restores_nor_probes(): void {
 		// Codex #91 round-3 P1: after install() the shipped code renewed the
 		// lease and carried on "because the rollback is still owed". A lost

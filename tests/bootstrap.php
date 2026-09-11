@@ -1663,6 +1663,11 @@ if ( ! class_exists( 'Plugin_Upgrader' ) ) {
 
 		public function upgrade( $plugin_file ) {
 			$GLOBALS['_mutations'][] = 'Plugin_Upgrader::upgrade';
+			// `_upgrade_effect` models what happens WHILE the upgrade runs (a
+			// claim seized mid-phase), the way `_install_effect` does for install().
+			if ( isset( $GLOBALS['_upgrade_effect'] ) && is_callable( $GLOBALS['_upgrade_effect'] ) ) {
+				call_user_func( $GLOBALS['_upgrade_effect'] );
+			}
 			return true;
 		}
 

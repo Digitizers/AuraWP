@@ -287,10 +287,16 @@ class Aura_Worker_Snapshots {
 		$published = $this->publish( $tmp, $path );
 		if ( true !== $published ) {
 			$this->discard_stage( $tmp );
-			// If this delete fails the record is harmless: its staged path is
-			// gone and restore's fence still governs the target by content.
-			$this->delete( $record['id'] );
+			// The record of a create that did NOT happen must not survive as a
+			// restorable one (Codex #94 round-5 P2): a winner that landed the
+			// same bytes — concurrent identical creates are the common race —
+			// would pass its hash check and lose its file to a restore of this
+			// orphan. Remove the record, and when the unlink is refused, VOID it
+			// in place so restore refuses it.
 			$out = array( 'success' => false, 'error' => (string) $published );
+			if ( ! $this->void_create_record( $record['id'] ) ) {
+				$out['stale_record'] = $record['id'];
+			}
 			if ( isset( $this->last_publish_detail ) && '' !== $this->last_publish_detail ) {
 				$out['detail'] = $this->last_publish_detail;
 			}
@@ -503,6 +509,51 @@ class Aura_Worker_Snapshots {
 		$ok = fsync( $fh );
 		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 		return (bool) $ok;
+	}
+
+	/**
+	 * Retire the record of a create that did not happen. Deletes the record
+	 * file; when that is refused, rewrites it without `expected_sha256` and
+	 * with `voided: true`, so restore_created_file() answers "carries no
+	 * expected hash" instead of deleting whatever holds the target now.
+	 *
+	 * @param string $id Snapshot id.
+	 * @return bool True when the record is gone or voided; false when it is
+	 *              still restorable and the caller must say so.
+	 */
+	private function void_create_record( $id ) {
+		$meta_path = $this->dir . basename( (string) $id ) . '.json';
+		$this->delete_record_file( $id );
+		if ( ! file_exists( $meta_path ) ) {
+			return true;
+		}
+		$record = $this->get( $id );
+		if ( ! is_array( $record ) ) {
+			return true; // undecodable: restore cannot act on it either
+		}
+		unset( $record['expected_sha256'], $record['staged'] );
+		$record['voided'] = true;
+		$json = wp_json_encode( $record );
+		if ( false === $json ) {
+			return false;
+		}
+		$n = @file_put_contents( $meta_path, $json ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- The record file this class owns; a refusal is answered to the caller, not surfaced as a warning.
+		return false !== $n && $n === strlen( $json ) && $this->sync_file( $meta_path );
+	}
+
+	/**
+	 * A record as it may leave the engine: without any local filesystem path.
+	 * `staged` (a create in flight), `payload_path` and `meta_path` are this
+	 * site's paths, not facts about the snapshot; every listing or lookup
+	 * that crosses the wire passes its records through here (Codex #94
+	 * round-5 P3 — `GET /aura/v2/snapshots` returned list_snapshots() verbatim).
+	 *
+	 * @param array $record A stored record.
+	 * @return array
+	 */
+	public static function redact( array $record ) {
+		unset( $record['staged'], $record['payload_path'], $record['meta_path'] );
+		return $record;
 	}
 
 	/**

@@ -111,8 +111,7 @@ class Aura_Tool_Snapshot_Get extends Aura_Tool_Base {
 		}
 
 		$payload_path = isset( $record['payload_path'] ) ? (string) $record['payload_path'] : '';
-		unset( $record['payload_path'] );
-		unset( $record['staged'] ); // a local filesystem path, like payload_path — never returned
+		$record = Aura_Worker_Snapshots::redact( $record ); // no local filesystem path ever leaves the engine
 
 		// ANOTHER BLOG'S CAPTURE (Ruling P15). Every blog on a multisite
 		// shares one snapshots directory and the ids are listed, so without

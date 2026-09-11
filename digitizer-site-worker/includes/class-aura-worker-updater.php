@@ -473,6 +473,12 @@ class Aura_Worker_Updater {
 		delete_option( 'aura_worker_boot_nonce' );
 		$healthy       = ! empty( $health_result['healthy'] );
 
+		// The verdict took a loopback round trip; a claim lost across it means
+		// the rollback below is the successor's to run (SA#93, closed here).
+		if ( ! $this->keep_self_update_claim( $fence ) ) {
+			return $this->self_update_claim_lost_after_install( $backup_path, true, true );
+		}
+
 		if ( ! $healthy && null !== $backup_path ) {
 			// Restoring works even though the on-disk plugin is broken: this
 			// method, Aura_Worker_Rollback and ZipArchive are all already in
@@ -893,14 +899,14 @@ class Aura_Worker_Updater {
 	 * @param bool        $installed   Whether install() reported success.
 	 * @return array
 	 */
-	private function self_update_claim_lost_after_install( $backup_path, $installed ) {
+	private function self_update_claim_lost_after_install( $backup_path, $installed, $health_checked = false ) {
 		return array(
 			'success'        => false,
 			'error'          => __( 'SiteAgent lost its self-update claim after installing; another self-update took over on this site and its own verdict now governs these files.', 'digitizer-site-worker' ),
 			'in_progress'    => true,
 			'installed'      => (bool) $installed,
 			'backed_up'      => null !== $backup_path,
-			'health_checked' => false,
+			'health_checked' => (bool) $health_checked,
 			'rolled_back'    => false,
 			'restore_error'  => null,
 		);
@@ -1028,6 +1034,12 @@ class Aura_Worker_Updater {
 
 		// 3. Health check.
 		$health_result = $health->run_health_check();
+		// The probe is a loopback request that can outlive the window too; a
+		// claim lost across it means the rollback below belongs to the
+		// successor (SA#93, closed here).
+		if ( ! $this->lease_kept( $fence ) ) {
+			return $this->batch_entry_claim_lost( $plugin_file );
+		}
 		if ( ! $health_result['healthy'] ) {
 			// 4. Auto-rollback.
 			if ( $backup_path ) {
@@ -1182,17 +1194,26 @@ class Aura_Worker_Updater {
 		// other path that can replace these files (Codex round-23 P1): a generic
 		// update landing between a self-update's backup, install and probe would
 		// have the beacon describing one build and the rollback restoring another.
-		$result = $this->guarding_self( $plugin_file, function ( $fence ) use ( $plugin_file ) {
-			return $this->heartbeat_during( $fence, function () use ( $plugin_file ) {
+		$lost   = false;
+		$result = $this->guarding_self( $plugin_file, function ( $fence ) use ( $plugin_file, &$lost ) {
+			$r = $this->heartbeat_during( $fence, function () use ( $plugin_file ) {
 				$skin     = new Automatic_Upgrader_Skin();
 				$upgrader = new Plugin_Upgrader( $skin );
 				return $upgrader->upgrade( $plugin_file );
 			} );
+			// A claim lost during the phase (a heartbeat that fired only at
+			// post-install passes through) is a successor owning these files:
+			// the outcome is ITS to report, never a success from here
+			// (Codex #94 round-5 P2).
+			if ( ! $this->lease_kept( $fence ) ) {
+				$lost = true;
+			}
+			return $r;
 		}, $busy, $refused );
 		if ( null !== $refused ) {
 			return $refused;
 		}
-		if ( $busy ) {
+		if ( $busy || $lost ) {
 			return $this->self_update_busy();
 		}
 

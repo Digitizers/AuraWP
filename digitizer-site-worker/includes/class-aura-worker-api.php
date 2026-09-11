@@ -1578,7 +1578,7 @@ class Aura_Worker_API {
 	 */
 	public function list_snapshots( $request ) {
 		$snapshots = new Aura_Worker_Snapshots();
-		$list      = $snapshots->list_snapshots();
+		$list      = array_map( array( 'Aura_Worker_Snapshots', 'redact' ), $snapshots->list_snapshots() );
 
 		return rest_ensure_response( array(
 			'snapshots' => $list,
