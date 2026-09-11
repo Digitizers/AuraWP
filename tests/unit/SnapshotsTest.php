@@ -1070,12 +1070,67 @@ final class SnapshotsTest extends TestCase {
 		$this->assertFileDoesNotExist( $file, 'the claim moved it off the path' );
 	}
 
-	public function test_a_host_with_link_disabled_fails_closed_with_nothing_at_the_target(): void {
-		// link() in disable_functions warns and returns null. Without the
-		// explicit guard that reads as an ordinary refusal carrying no message.
+	public function test_a_host_without_link_publishes_by_claim_and_rename_and_the_record_restores(): void {
+		// SiteAgent#96: Cloudways puts link() in disable_functions for web PHP,
+		// so the create path was dead on most of the fleet. Without link() the
+		// target is claimed with fopen('x') (no-clobber, an empty placeholder we
+		// own) and the stage is renamed over it: absent → empty → complete.
 		$file  = WP_CONTENT_DIR . '/nolinkfn.php';
 		$snaps = new class extends Aura_Worker_Snapshots {
 			protected function link_available() {
+				return false;
+			}
+		};
+
+		$res = $snaps->create_file( $file, "<?php // by rename\n" );
+
+		$this->assertTrue( $res['success'] );
+		$this->assertSame( 'rename', $res['published'] );
+		$this->assertSame( "<?php // by rename\n", file_get_contents( $file ) );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ), 'the stage was moved, not copied' );
+		$this->assertArrayNotHasKey( 'staged', $res['snapshot'] );
+		$restore = $snaps->restore( $res['snapshot']['id'] );
+		$this->assertTrue( $restore['success'] );
+		$this->assertFileDoesNotExist( $file, 'the record of a rename-published create restores by unlinking, like a linked one' );
+	}
+
+	public function test_link_publishes_report_link(): void {
+		$file = WP_CONTENT_DIR . '/bylink.php';
+		$res  = ( new Aura_Worker_Snapshots() )->create_file( $file, "x\n" );
+		$this->assertTrue( $res['success'] );
+		$this->assertSame( 'link', $res['published'] );
+	}
+
+	public function test_without_link_a_target_that_appears_before_the_claim_is_exists_with_nothing_left_behind(): void {
+		$file  = WP_CONTENT_DIR . '/nolink-race.php';
+		$snaps = new class( $file ) extends Aura_Worker_Snapshots {
+			private $race;
+			public function __construct( $race ) { parent::__construct(); $this->race = $race; }
+			protected function link_available() {
+				return false;
+			}
+			protected function persist_create_record( array $meta ) {
+				file_put_contents( $this->race, "theirs\n" ); // lands between the early check and the claim
+				return parent::persist_create_record( $meta );
+			}
+		};
+
+		$res = $snaps->create_file( $file, "mine\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'exists', $res['error'] );
+		$this->assertSame( "theirs\n", file_get_contents( $file ), 'fopen(x) refused: the newcomer is untouched' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+		$this->assertSame( array(), $snaps->list_snapshots(), 'the record of a create that did not happen is gone' );
+	}
+
+	public function test_without_link_a_refused_rename_takes_the_placeholder_back_and_fails_closed(): void {
+		$file  = WP_CONTENT_DIR . '/nolink-norename.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function link_available() {
+				return false;
+			}
+			protected function rename_into_place( $from, $to ) {
 				return false;
 			}
 		};
@@ -1084,13 +1139,21 @@ final class SnapshotsTest extends TestCase {
 
 		$this->assertFalse( $res['success'] );
 		$this->assertSame( 'unsupported_filesystem', $res['error'] );
-		$this->assertSame( 'link() is disabled on this host', $res['detail'] );
-		$this->assertFileDoesNotExist( $file );
-		$this->assertSame( array(), $snaps->list_snapshots(), 'the record is deleted when publish is refused' );
+		$this->assertStringContainsString( 'rename() refused', $res['detail'] );
+		$this->assertFileDoesNotExist( $file, 'our empty placeholder is taken back' );
 		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+		$this->assertSame( array(), $snaps->list_snapshots() );
 	}
 
-	public function test_a_changed_file_is_kept_aside_when_the_host_cannot_link_it_back(): void {
+	public function test_publish_mode_names_link_on_this_host(): void {
+		$this->assertSame( function_exists( 'link' ) ? 'link' : 'rename', Aura_Worker_Snapshots::publish_mode() );
+	}
+
+	public function test_without_link_a_changed_file_is_put_back_by_claim_and_rename(): void {
+		// SiteAgent#96: a host without link() used to strand every edited file
+		// under its .aura-restore-* name. The put-back now claims the path with
+		// fopen('x') and renames the claimed file over the placeholder; the
+		// claim name is consumed by the move.
 		$file  = WP_CONTENT_DIR . '/nolinkback.php';
 		$snaps = new class extends Aura_Worker_Snapshots {
 			public $allow_link = true;
@@ -1106,8 +1169,56 @@ final class SnapshotsTest extends TestCase {
 
 		$this->assertFalse( $restore['success'] );
 		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertArrayNotHasKey( 'moved_aside', $restore );
+		$this->assertSame( "edited\n", file_get_contents( $file ), 'put back at its path, same bytes' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-restore-*' ), 'the claim name was consumed by the move' );
+	}
+
+	public function test_without_link_a_changed_file_whose_path_was_retaken_is_kept_aside_and_named(): void {
+		$file  = WP_CONTENT_DIR . '/nolinkback-taken.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			public $allow_link = true;
+			protected function link_available() {
+				return $this->allow_link;
+			}
+			protected function after_claim( $claim, $target ) {
+				file_put_contents( $target, "newcomer\n" ); // the path is retaken in the window
+			}
+		};
+		$rec = $snaps->create_file( $file, "a\n" )['snapshot'];
+		file_put_contents( $file, "edited\n" );
+		$snaps->allow_link = false;
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertSame( "newcomer\n", file_get_contents( $file ), 'fopen(x) refused: the newcomer is untouched' );
+		$this->assertMatchesRegularExpression( '/\/\.aura-restore-[0-9a-f]{16}$/', $restore['moved_aside'] );
+		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ), 'the changed bytes are kept, not deleted' );
+	}
+
+	public function test_without_link_a_refused_put_back_rename_keeps_the_file_aside_and_the_placeholder_is_taken_back(): void {
+		$file  = WP_CONTENT_DIR . '/nolinkback-norename.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			public $allow_link = true;
+			protected function link_available() {
+				return $this->allow_link;
+			}
+			protected function rename_into_place( $from, $to ) {
+				return $this->allow_link ? parent::rename_into_place( $from, $to ) : false;
+			}
+		};
+		$rec = $snaps->create_file( $file, "a\n" )['snapshot'];
+		file_put_contents( $file, "edited\n" );
+		$snaps->allow_link = false;
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertSame( 'file_changed_since', $restore['error'] );
 		$this->assertArrayHasKey( 'moved_aside', $restore );
-		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ), 'nothing is deleted on this branch' );
+		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ) );
+		$this->assertFileDoesNotExist( $file, 'no empty placeholder is left at the path' );
 	}
 }
 

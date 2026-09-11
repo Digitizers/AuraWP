@@ -298,11 +298,14 @@ class Aura_Worker_Snapshots {
 		// it from list_snapshots() — but the RETURNED one carries no local path
 		// at all (Codex #94 round-6 P3): step 4 deleted the staged file, and
 		// `meta_path` is this site's directory, not a fact about the snapshot.
-		return array( 'success' => true, 'snapshot' => self::redact( $record ) );
+		return array( 'success' => true, 'published' => $this->last_publish_mode, 'snapshot' => self::redact( $record ) );
 	}
 
 	/** The last publish() failure's PHP message, for the caller's `detail`. */
 	private $last_publish_detail = '';
+
+	/** How the last publish() landed: 'link' or 'rename'; '' when it did not. */
+	private $last_publish_mode = '';
 
 	/**
 	 * Write the complete content to a temporary file this call owns, beside
@@ -401,8 +404,15 @@ class Aura_Worker_Snapshots {
 	}
 
 	/**
-	 * Publish the staged bytes at the target with link(): atomic, and it
-	 * refuses to clobber. rename() clobbers and is not a substitute.
+	 * Publish the staged bytes at the target: atomic, and it refuses to
+	 * clobber. With link() that is one call. Where link() is disabled (most
+	 * managed hosts put it in disable_functions — Cloudways does, SiteAgent#96)
+	 * the target is CLAIMED first with fopen( 'xb' ), which refuses an
+	 * existing path and leaves an empty file we own, and the stage is then
+	 * rename()d over that placeholder — atomic within the directory, and it
+	 * replaces only what this call created. The states a reader can see are
+	 * absent → empty → complete, never a partial file; an empty .php is a
+	 * no-op include. rename() alone is not a substitute: it clobbers.
 	 *
 	 * Protected so a test can model a race (the target appears first) or a
 	 * filesystem that refuses hard links.
@@ -410,20 +420,18 @@ class Aura_Worker_Snapshots {
 	 * @param string $tmp  Staged path.
 	 * @param string $path Target path.
 	 * @return true|string true, 'exists' (the target was there first), or
-	 *                     'unsupported_filesystem' (link() refused; nothing written).
+	 *                     'unsupported_filesystem' (neither publish worked; nothing written).
 	 */
 	protected function publish( $tmp, $path ) {
 		$this->last_publish_detail = '';
-		// Fail closed, and SAY so: a host with link() in disable_functions makes
-		// the call warn and return null, which would otherwise be classified
-		// below as an ordinary refusal with no message to explain it.
+		$this->last_publish_mode   = '';
 		if ( ! $this->link_available() ) {
-			$this->last_publish_detail = 'link() is disabled on this host';
-			return 'unsupported_filesystem';
+			return $this->publish_by_rename( $tmp, $path );
 		}
 		error_clear_last();
 		$ok = @link( $tmp, $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is an expected answer, not a warning to surface; it is classified below.
 		if ( $ok ) {
+			$this->last_publish_mode = 'link';
 			return true;
 		}
 		$err                       = error_get_last();
@@ -437,6 +445,63 @@ class Aura_Worker_Snapshots {
 		// Any other refusal: the filesystem cannot give us an atomic, no-clobber
 		// publish. Fail closed — nothing was written at the target.
 		return 'unsupported_filesystem';
+	}
+
+	/**
+	 * The link()-less publish: claim the target with an exclusive create,
+	 * then move the stage over our own placeholder. See publish().
+	 *
+	 * @param string $tmp  Staged path.
+	 * @param string $path Target path.
+	 * @return true|string As publish().
+	 */
+	private function publish_by_rename( $tmp, $path ) {
+		$fh = @fopen( $path, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- 'x' is the no-clobber claim; EEXIST is the expected refusal, classified below.
+		if ( false === $fh ) {
+			if ( self::path_present( $path ) ) {
+				return 'exists';
+			}
+			$this->last_publish_detail = 'link() is disabled on this host and the target could not be claimed';
+			return 'unsupported_filesystem';
+		}
+		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		if ( $this->rename_into_place( $tmp, $path ) ) {
+			$this->last_publish_mode = 'rename';
+			return true;
+		}
+		// Our placeholder is still there and still empty: take it back. Anything
+		// with bytes at the path is not ours to remove.
+		if ( is_file( $path ) && 0 === filesize( $path ) ) {
+			wp_delete_file( $path );
+		}
+		$this->last_publish_detail = 'link() is disabled on this host and rename() refused';
+		return 'unsupported_filesystem';
+	}
+
+	/**
+	 * rename() as one seam: a test models a filesystem that refuses the move.
+	 *
+	 * @param string $from Source path.
+	 * @param string $to   Destination path (a file this call owns).
+	 * @return bool
+	 */
+	protected function rename_into_place( $from, $to ) {
+		return (bool) @rename( $from, $to ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.rename_rename -- Atomic within the directory and over a placeholder this call created; $wp_filesystem->move() may copy+delete, which is neither.
+	}
+
+	/**
+	 * How a create publishes on this host: 'link' (atomic hard link),
+	 * 'rename' (exclusive-create placeholder + rename — absent → empty →
+	 * complete), or null when neither is callable. Reported by
+	 * audit_agent_code so the fleet knows which sites can create reversibly.
+	 *
+	 * @return string|null
+	 */
+	public static function publish_mode() {
+		if ( function_exists( 'link' ) ) {
+			return 'link';
+		}
+		return function_exists( 'rename' ) ? 'rename' : null;
 	}
 
 	/**
@@ -979,20 +1044,52 @@ class Aura_Worker_Snapshots {
 		// path is taken — the changed file stays beside it under its claim name
 		// and the answer says where. Nothing is ever deleted on this branch.
 		$out = array( 'success' => false, 'error' => 'file_changed_since' );
-		// A host without link() takes the moved_aside branch outright: nothing is
-		// attempted at the target and, as on every path here, nothing is deleted.
-		if ( $this->link_available() && @link( $claim, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is the expected refusal, classified below.
-			wp_delete_file( $claim ); // the second name to the same inode; the file is back at its path
-			if ( file_exists( $claim ) ) {
-				// The file is back, but its claim name could not be removed and
-				// `.aura-restore-*` is never swept: say where it is, as the
-				// matching-hash branch does (Codex #94 round-7 P2).
+		if ( $this->link_available() ) {
+			if ( @link( $claim, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is the expected refusal, classified below.
+				wp_delete_file( $claim ); // the second name to the same inode; the file is back at its path
+				if ( file_exists( $claim ) ) {
+					// The file is back, but its claim name could not be removed and
+					// `.aura-restore-*` is never swept: say where it is, as the
+					// matching-hash branch does (Codex #94 round-7 P2).
+					$out['moved_aside'] = $claim;
+				}
+			} else {
 				$out['moved_aside'] = $claim;
 			}
-		} else {
+			return $out;
+		}
+		// A host without link() (SiteAgent#96) puts the file back the way
+		// publish() lands one: claim the path with an exclusive create, then
+		// rename the claimed file over our own placeholder — no-clobber, and
+		// the claim name is consumed by the move. A refused claim means the
+		// path is taken: the changed file stays aside and the answer says where.
+		if ( ! $this->put_back_by_rename( $claim, $target ) ) {
 			$out['moved_aside'] = $claim;
 		}
 		return $out;
+	}
+
+	/**
+	 * The link()-less put-back: exclusive-create the target, rename the
+	 * claimed file over it. True when the file is back at its path.
+	 *
+	 * @param string $claim  The claimed (renamed) file.
+	 * @param string $target The original path.
+	 * @return bool
+	 */
+	private function put_back_by_rename( $claim, $target ) {
+		$fh = @fopen( $target, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- 'x' is the no-clobber claim; a refusal means the path is taken.
+		if ( false === $fh ) {
+			return false;
+		}
+		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		if ( $this->rename_into_place( $claim, $target ) ) {
+			return true;
+		}
+		if ( is_file( $target ) && 0 === filesize( $target ) ) {
+			wp_delete_file( $target ); // our empty placeholder, nothing else
+		}
+		return false;
 	}
 
 	/**

@@ -17,7 +17,7 @@
   </a>
   <img src="https://img.shields.io/badge/WordPress-6.2%E2%80%937.1-21759b?logo=wordpress" alt="WordPress" />
   <img src="https://img.shields.io/badge/PHP-7.4%2B-777bb4?logo=php" alt="PHP" />
-  <img src="https://img.shields.io/badge/Stable-2.17.0-green" alt="Stable" />
+  <img src="https://img.shields.io/badge/Stable-2.17.1-green" alt="Stable" />
 </p>
 
 ---
@@ -238,6 +238,11 @@ These plug straight into **Aura's Fleet MCP Gateway**: read tools run on demand,
 ---
 
 ## Changelog
+
+### 2.17.1
+
+- **Snapshots: `create_file()` publishes without `link()`.** Most managed hosts put `link()` in `disable_functions` for web PHP (Cloudways does — SiteAgent#96), and 2.17.0 refused every new-file create there with `unsupported_filesystem`. Without `link()` the target is claimed with an exclusive create (an empty placeholder this call owns, so nothing is clobbered) and the staged file is renamed over it: a reader sees absent, empty, or complete — never a partial file, and an empty `.php` is a no-op include. Restoring a created file that was edited since puts it back the same way instead of stranding it under its `.aura-restore-*` name. The create result carries `published: link | rename`.
+- **`audit_agent_code`:** `power_pack.create_publish` reports how a create lands on this host (`link`, `rename`, or `null` when the Power Pack cannot create a new file here), so the fleet audit can say which sites create reversibly.
 
 ### 2.17.0
 
