@@ -459,12 +459,13 @@ class Aura_Worker_Snapshots {
 	 * @return true|string As publish().
 	 */
 	private function publish_by_write( $tmp, $path ) {
-		$bytes = @file_get_contents( $tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- Our own staged file; a refusal is answered below.
-		if ( false === $bytes ) {
+		$src = @fopen( $tmp, 'rb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Our own staged file; a refusal is answered below.
+		if ( false === $src ) {
 			$this->last_publish_detail = 'the staged bytes could not be read back';
 			return 'unsupported_filesystem';
 		}
-		$landed = $this->write_exclusively( $path, $bytes );
+		$landed = $this->write_exclusively( $path, $src );
+		fclose( $src ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 		if ( true === $landed ) {
 			$this->last_publish_mode = 'write';
 			return true;
@@ -477,15 +478,18 @@ class Aura_Worker_Snapshots {
 	}
 
 	/**
-	 * Create $path exclusively and write $bytes into it — the one primitive
+	 * Create $path exclusively and stream $src into it — the one primitive
 	 * behind the link()-less publish and put-back. fopen( 'xb' ) refuses an
 	 * existing path (no clobber, ever) and returns an inode this call owns;
 	 * after the write the directory entry is re-read and must still be that
 	 * inode, or the bytes went to an entry a racer already unlinked and the
-	 * path is not ours to report on.
+	 * path is not ours to report on. Nothing here ever addresses the path by
+	 * name once it is claimed — not even for the mode, which is set at
+	 * creation through the process umask (PHP exposes no fchmod(); a chmod()
+	 * by pathname could dress a racer's replacement file — Codex #97 round-2).
 	 *
-	 * @param string $path  Target path.
-	 * @param string $bytes Content.
+	 * @param string   $path Target path.
+	 * @param resource $src  Readable handle with the bytes.
 	 * @return true|string true; 'exists' (the path was taken — before the claim,
 	 *                     or by a racer who unlinked our entry and took it during
 	 *                     the write); or a sentence saying what refused. On a
@@ -493,14 +497,16 @@ class Aura_Worker_Snapshots {
 	 *                     (truncated, never unlinked by pathname) and the sentence
 	 *                     names it.
 	 */
-	private function write_exclusively( $path, $bytes ) {
-		$fh = @fopen( $path, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- 'x' is the no-clobber claim; EEXIST is the expected refusal, classified below.
+	private function write_exclusively( $path, $src ) {
+		$mode = defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644;
+		$was  = umask( 0777 & ~$mode ); // the mode is decided AT creation, on our inode only
+		$fh   = @fopen( $path, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- 'x' is the no-clobber claim; EEXIST is the expected refusal, classified below.
+		umask( $was );
 		if ( false === $fh ) {
 			return self::path_present( $path ) ? 'exists' : 'the target could not be claimed';
 		}
-		$mine = fstat( $fh );
-		@chmod( $path, defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_chmod -- Mode of the entry this call just created; mode only.
-		$written = $this->write_all( $fh, $bytes );
+		$mine    = fstat( $fh );
+		$written = $this->write_all( $fh, $src );
 		$synced  = $written && fflush( $fh ) && ( function_exists( 'fsync' ) ? (bool) fsync( $fh ) : true );
 		$this->during_write( $path );
 		$now        = @stat( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- The entry may be gone; that is an answer.
@@ -524,21 +530,29 @@ class Aura_Worker_Snapshots {
 	}
 
 	/**
-	 * Write every byte or say so. Seam: a test models a short write.
+	 * Copy $src into $fh, chunk by chunk, or say so. Bounded memory whatever
+	 * the size (a changed file put back on restore can be anything the site
+	 * grew it to — Codex #97 round-2 P2). Seam: a test models a short write.
 	 *
-	 * @param resource $fh    Open handle.
-	 * @param string   $bytes Content.
+	 * @param resource $fh  Open destination handle.
+	 * @param resource $src Open readable source handle.
 	 * @return bool
 	 */
-	protected function write_all( $fh, $bytes ) {
-		$len = strlen( $bytes );
-		$off = 0;
-		while ( $off < $len ) {
-			$n = fwrite( $fh, substr( $bytes, $off ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite
-			if ( false === $n || 0 === $n ) {
+	protected function write_all( $fh, $src ) {
+		while ( ! feof( $src ) ) {
+			$chunk = fread( $src, 65536 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fread
+			if ( false === $chunk ) {
 				return false;
 			}
-			$off += $n;
+			$len = strlen( $chunk );
+			$off = 0;
+			while ( $off < $len ) {
+				$n = fwrite( $fh, substr( $chunk, $off ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite
+				if ( false === $n || 0 === $n ) {
+					return false;
+				}
+				$off += $n;
+			}
 		}
 		return true;
 	}
@@ -686,7 +700,7 @@ class Aura_Worker_Snapshots {
 	 * @return bool True when the record is voided (or undecodable — restore
 	 *              cannot act on that either); false when the rewrite failed.
 	 */
-	private function void_record_in_place( $id, array $extra = array() ) {
+	protected function void_record_in_place( $id, array $extra = array() ) {
 		$meta_path = $this->dir . basename( (string) $id ) . '.json';
 		$record    = $this->get( $id );
 		if ( ! is_array( $record ) ) {
@@ -760,22 +774,28 @@ class Aura_Worker_Snapshots {
 	 * and marked `interrupted` so the listing says why (Codex #97 round-1 P1).
 	 * An absent target needs nothing: restore on the record is "already gone".
 	 *
+	 * The stage is the signal that reconciliation is still owed: when the
+	 * record could not be voided (snapshot directory unwritable, disk full)
+	 * the stage must STAY so the next sweep tries again — deleting it would
+	 * leave the record restorable for good (Codex #97 round-2 P2).
+	 *
 	 * @param array|null $rec The record naming the stage, or null.
+	 * @return bool True when the stage may be deleted.
 	 */
-	private function reconcile_stage( $rec ) {
+	protected function reconcile_stage( $rec ) {
 		if ( ! is_array( $rec ) || empty( $rec['id'] ) ) {
-			return;
+			return true;
 		}
 		$target   = (string) ( $rec['target'] ?? '' );
 		$expected = (string) ( $rec['expected_sha256'] ?? '' );
 		if ( '' === $target || '' === $expected || ! is_file( $target ) ) {
-			return;
+			return true;
 		}
 		$actual = hash_file( 'sha256', $target );
 		if ( is_string( $actual ) && hash_equals( $expected, $actual ) ) {
-			return; // published; only the stage cleanup was lost
+			return true; // published; only the stage cleanup was lost
 		}
-		$this->void_record_in_place( (string) $rec['id'], array( 'interrupted' => true ) );
+		return $this->void_record_in_place( (string) $rec['id'], array( 'interrupted' => true ) );
 	}
 
 	/**
@@ -804,8 +824,9 @@ class Aura_Worker_Snapshots {
 			}
 			$at = filemtime( $stray );
 			if ( false !== $at && $at < $cut ) {
-				$this->reconcile_stage( $this->record_for_stage( $stray ) );
-				wp_delete_file( $stray );
+				if ( $this->reconcile_stage( $this->record_for_stage( $stray ) ) ) {
+					wp_delete_file( $stray );
+				}
 			}
 		}
 	}
@@ -1199,19 +1220,21 @@ class Aura_Worker_Snapshots {
 	}
 
 	/**
-	 * The link()-less put-back: exclusive-create the target and write the
-	 * claimed file's bytes into it. See write_exclusively().
+	 * The link()-less put-back: exclusive-create the target and stream the
+	 * claimed file into it. See write_exclusively().
 	 *
 	 * @param string $claim  The claimed (renamed) file.
 	 * @param string $target The original path.
 	 * @return true|string true when the bytes are back at their path.
 	 */
 	private function put_back_by_write( $claim, $target ) {
-		$bytes = @file_get_contents( $claim ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- The file this call holds under its claim name.
-		if ( false === $bytes ) {
+		$src = @fopen( $claim, 'rb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- The file this call holds under its claim name.
+		if ( false === $src ) {
 			return 'the claimed file could not be read';
 		}
-		return $this->write_exclusively( $target, $bytes );
+		$out = $this->write_exclusively( $target, $src );
+		fclose( $src ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		return $out;
 	}
 
 	/**
@@ -1653,8 +1676,9 @@ class Aura_Worker_Snapshots {
 				if ( is_file( $staged ) ) {
 					$at = filemtime( $staged );
 					if ( false !== $at && $at < time() - self::STAGE_MAX_AGE ) {
-						$this->reconcile_stage( $rec );
-						wp_delete_file( $staged );
+						if ( $this->reconcile_stage( $rec ) ) {
+							wp_delete_file( $staged );
+						}
 					}
 				}
 			}

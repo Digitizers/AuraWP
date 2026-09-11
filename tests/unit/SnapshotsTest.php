@@ -1088,6 +1088,7 @@ final class SnapshotsTest extends TestCase {
 		$this->assertTrue( $res['success'] );
 		$this->assertSame( 'write', $res['published'] );
 		$this->assertSame( "<?php // by write\n", file_get_contents( $file ) );
+		$this->assertSame( defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644, fileperms( $file ) & 0777, 'the mode is set at creation (umask), never by a pathname chmod' );
 		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ), 'the stage is discarded after the publish' );
 		$this->assertArrayNotHasKey( 'staged', $res['snapshot'] );
 		$restore = $snaps->restore( $res['snapshot']['id'] );
@@ -1154,8 +1155,8 @@ final class SnapshotsTest extends TestCase {
 			protected function link_available() {
 				return false;
 			}
-			protected function write_all( $fh, $bytes ) {
-				fwrite( $fh, substr( $bytes, 0, 3 ) ); // a partial write, then the disk says no
+			protected function write_all( $fh, $src ) {
+				fwrite( $fh, fread( $src, 3 ) ); // a partial write, then the disk says no
 				return false;
 			}
 		};
@@ -1186,8 +1187,8 @@ final class SnapshotsTest extends TestCase {
 			protected function link_available() {
 				return false;
 			}
-			protected function write_all( $fh, $bytes ) {
-				fwrite( $fh, substr( $bytes, 0, 5 ) );
+			protected function write_all( $fh, $src ) {
+				fwrite( $fh, fread( $src, 5 ) );
 				throw new RuntimeException( 'simulated kill mid-write' );
 			}
 		};
@@ -1213,6 +1214,43 @@ final class SnapshotsTest extends TestCase {
 		$this->assertArrayNotHasKey( 'expected_sha256', $rec );
 		$this->assertFalse( $snaps->restore( $rec['id'] )['success'] );
 		$this->assertSame( '<?php', file_get_contents( $file ), 'never deleted by a restore' );
+	}
+
+	public function test_a_stage_is_kept_when_the_interrupted_record_cannot_be_voided_so_the_next_sweep_retries(): void {
+		// Codex #97 round-2 P2: the stage is the signal that reconciliation is
+		// owed. If the record cannot be rewritten (snapshot dir full), deleting
+		// the stage would leave the record restorable for good.
+		$file  = WP_CONTENT_DIR . '/interrupted-novoid.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			public $void_ok = true;
+			protected function link_available() {
+				return false;
+			}
+			protected function write_all( $fh, $src ) {
+				fwrite( $fh, fread( $src, 5 ) );
+				throw new RuntimeException( 'simulated kill mid-write' );
+			}
+			protected function void_record_in_place( $id, array $extra = array() ) {
+				return $this->void_ok ? parent::void_record_in_place( $id, $extra ) : false;
+			}
+		};
+		try {
+			$snaps->create_file( $file, "<?php // whole file\n" );
+		} catch ( RuntimeException $e ) {
+			// expected
+		}
+		$recs   = $snaps->list_snapshots();
+		$staged = $recs[0]['staged'];
+		touch( $staged, time() - 2 * HOUR_IN_SECONDS );
+		$snaps->void_ok = false;
+
+		$snaps->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+
+		$this->assertFileExists( $staged, 'kept: the record is still restorable, the sweep must try again' );
+		$snaps->void_ok = true;
+		$snaps->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+		$this->assertFileDoesNotExist( $staged );
+		$this->assertTrue( $snaps->list_snapshots()[0]['voided'] );
 	}
 
 	public function test_a_completed_publish_whose_stage_cleanup_was_lost_keeps_its_record(): void {
@@ -1291,8 +1329,8 @@ final class SnapshotsTest extends TestCase {
 			protected function link_available() {
 				return $this->allow_link;
 			}
-			protected function write_all( $fh, $bytes ) {
-				return $this->allow_link ? parent::write_all( $fh, $bytes ) : false;
+			protected function write_all( $fh, $src ) {
+				return $this->allow_link ? parent::write_all( $fh, $src ) : false;
 			}
 		};
 		$rec = $snaps->create_file( $file, "a\n" )['snapshot'];
