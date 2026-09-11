@@ -505,6 +505,10 @@ class Aura_Worker_Snapshots {
 	 * @param string   $path Target path.
 	 * @param resource $src  Readable handle with the bytes.
 	 * @param int|null $mode Mode for the new entry; null = FS_CHMOD_FILE (0644).
+	 *                       fopen() creates from a base of 0666 and a umask can only
+	 *                       REMOVE bits, so execute bits cannot be produced here: a
+	 *                       fresh create lands with `mode & 0666`, and a caller that
+	 *                       must keep execute bits refuses before calling (put-back).
 	 * @return true|string true; 'exists' (the path was taken — before the claim,
 	 *                     or by a racer who unlinked our entry and took it during
 	 *                     the write); 'partial' (the write was short AND the entry
@@ -517,7 +521,7 @@ class Aura_Worker_Snapshots {
 	 *                     'partial' too.
 	 */
 	private function write_exclusively( $path, $src, $mode = null ) {
-		$mode = null === $mode ? ( defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644 ) : (int) $mode;
+		$mode = ( null === $mode ? ( defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644 ) : (int) $mode ) & 0666;
 		$was  = umask( 0777 & ~$mode ); // the mode is decided AT creation, on our inode only
 		$fh   = @fopen( $path, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- 'x' is the no-clobber claim; EEXIST is the expected refusal, classified below.
 		umask( $was );
@@ -1268,8 +1272,17 @@ class Aura_Worker_Snapshots {
 		if ( false === $src ) {
 			return 'the claimed file could not be read';
 		}
-		$st  = fstat( $src );
-		$out = $this->write_exclusively( $target, $src, is_array( $st ) ? ( $st['mode'] & 0777 ) : null ); // the file comes back with the mode it had (Codex #97 round-3 P2)
+		$st   = fstat( $src );
+		$mode = is_array( $st ) ? ( (int) $st['mode'] & 0777 ) : null;
+		if ( null !== $mode && 0 !== ( $mode & 0111 ) ) {
+			// fopen() cannot create an executable (base 0666; a umask only removes
+			// bits) and nothing here addresses the path by name, so an executable
+			// cannot come back as it was without link(): it stays aside, named
+			// (Codex #97 round-4 P2).
+			fclose( $src ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+			return sprintf( 'the file is executable (mode %o) and that cannot be recreated without link()', $mode );
+		}
+		$out = $this->write_exclusively( $target, $src, $mode ); // the file comes back with the mode it had (Codex #97 round-3 P2)
 		fclose( $src ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 		return $out;
 	}

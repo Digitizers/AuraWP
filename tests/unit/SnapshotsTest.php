@@ -1380,6 +1380,32 @@ final class SnapshotsTest extends TestCase {
 		$this->assertSame( '<?php', file_get_contents( $file ), 'never deleted by a restore' );
 	}
 
+	public function test_without_link_an_executable_changed_file_is_kept_aside_because_its_mode_cannot_be_recreated(): void {
+		// Codex #97 round-4 P2: fopen() creates from 0666 and a umask only
+		// removes bits — a 0755 file would come back 0644. Refuse the put-back
+		// instead: the file stays aside under its claim name, nothing lands at
+		// the path.
+		$file  = WP_CONTENT_DIR . '/nolinkback-exec.sh';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			public $allow_link = true;
+			protected function link_available() {
+				return $this->allow_link;
+			}
+		};
+		$rec = $snaps->create_file( $file, "#!/bin/sh\n" )['snapshot'];
+		file_put_contents( $file, "#!/bin/sh\necho edited\n" );
+		chmod( $file, 0755 );
+		$snaps->allow_link = false;
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertArrayHasKey( 'moved_aside', $restore );
+		$this->assertFileDoesNotExist( $file, 'nothing lands at the path with a lesser mode' );
+		$this->assertSame( 0755, fileperms( $restore['moved_aside'] ) & 0777, 'the claim keeps the executable mode' );
+		$this->assertSame( "#!/bin/sh\necho edited\n", file_get_contents( $restore['moved_aside'] ) );
+	}
+
 	public function test_without_link_a_short_put_back_write_keeps_the_file_aside_and_leaves_our_empty_entry(): void {
 		$file  = WP_CONTENT_DIR . '/nolinkback-short.php';
 		$snaps = new class extends Aura_Worker_Snapshots {
