@@ -253,6 +253,19 @@ class Aura_Worker_Snapshots {
 			$this->discard_stage( $tmp );
 			return array( 'success' => false, 'error' => 'Failed to persist snapshot (disk full or unwritable).' );
 		}
+		// The record's bytes reach the disk BEFORE the target is published
+		// (Codex #94 round-4 P2): persist() writes with file_put_contents(),
+		// which never syncs, so a power loss after link() could leave the
+		// target on disk and the record not. What PHP cannot do is sync a
+		// DIRECTORY entry (a directory cannot be opened as a stream), so the
+		// record's and the target's directory entries are outside this
+		// guarantee — a crash in that window is the same class the staged-name
+		// sweep and prune_older_than() already recover from.
+		if ( ! $this->sync_file( $record['meta_path'] ) ) {
+			$this->discard_stage( $tmp );
+			$this->delete_record_file( $record['id'] );
+			return array( 'success' => false, 'error' => 'Unable to sync the snapshot record to disk; nothing created.' );
+		}
 		// The record is RE-READ before anything is published (Codex round-1
 		// P1): a short metadata write is the one failure persist() reported as
 		// success, and a target published over an undecodable record has no
@@ -467,6 +480,29 @@ class Aura_Worker_Snapshots {
 	 */
 	protected function persist_create_record( array $meta ) {
 		return $this->persist( $meta );
+	}
+
+	/**
+	 * Flush one file's bytes to disk. True when fsync() is unavailable (PHP
+	 * < 8.1 — the write already returned and there is nothing more this
+	 * runtime can ask of the kernel); false when the file cannot be opened
+	 * or the kernel refuses. Directory entries are NOT covered: PHP cannot
+	 * open a directory as a stream.
+	 *
+	 * @param string $path File path.
+	 * @return bool
+	 */
+	private function sync_file( $path ) {
+		if ( ! function_exists( 'fsync' ) ) {
+			return true;
+		}
+		$fh = @fopen( $path, 'rb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- A handle only, to fsync a file this class just wrote; the failure is answered, not surfaced as a warning.
+		if ( false === $fh ) {
+			return false;
+		}
+		$ok = fsync( $fh );
+		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		return (bool) $ok;
 	}
 
 	/**
