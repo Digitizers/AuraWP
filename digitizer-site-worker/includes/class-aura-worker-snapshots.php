@@ -281,6 +281,18 @@ class Aura_Worker_Snapshots {
 
 		// 3. Publish: atomic, no-clobber.
 		$published = $this->publish( $tmp, $path );
+		if ( 'partial' === $published ) {
+			// Partial bytes sit at the target and could not be emptied (Codex
+			// #97 round-3 P2). The record is voided in place and marked
+			// interrupted — restore can never delete that file — and the stage
+			// is KEPT: it is the reconciler's signal and the operator's copy of
+			// what should have landed. Nothing is discarded that a repair needs.
+			$out = array( 'success' => false, 'error' => 'unsupported_filesystem', 'detail' => $this->last_publish_detail, 'stale_record' => $record['id'] );
+			if ( $this->void_record_in_place( $record['id'], array( 'interrupted' => true ) ) ) {
+				$out['detail'] .= '; record ' . $record['id'] . ' voided and marked interrupted, staged bytes kept at ' . $tmp;
+			}
+			return $out;
+		}
 		if ( true !== $published ) {
 			$out = $this->abandon_create( $tmp, $record['id'], (string) $published );
 			if ( isset( $this->last_publish_detail ) && '' !== $this->last_publish_detail ) {
@@ -422,8 +434,10 @@ class Aura_Worker_Snapshots {
 	 *
 	 * @param string $tmp  Staged path.
 	 * @param string $path Target path.
-	 * @return true|string true, 'exists' (the target was there first), or
-	 *                     'unsupported_filesystem' (the publish could not land; see `detail`).
+	 * @return true|string true, 'exists' (the target was there first),
+	 *                     'unsupported_filesystem' (the publish could not land; see `detail`),
+	 *                     or 'partial' (link()-less only: a short write whose partial
+	 *                     bytes could not be emptied — the caller keeps recovery state).
 	 */
 	protected function publish( $tmp, $path ) {
 		$this->last_publish_detail = '';
@@ -470,8 +484,8 @@ class Aura_Worker_Snapshots {
 			$this->last_publish_mode = 'write';
 			return true;
 		}
-		if ( 'exists' === $landed ) {
-			return 'exists';
+		if ( 'exists' === $landed || 'partial' === $landed ) {
+			return $landed;
 		}
 		$this->last_publish_detail = 'link() is disabled on this host and ' . $landed;
 		return 'unsupported_filesystem';
@@ -490,15 +504,20 @@ class Aura_Worker_Snapshots {
 	 *
 	 * @param string   $path Target path.
 	 * @param resource $src  Readable handle with the bytes.
+	 * @param int|null $mode Mode for the new entry; null = FS_CHMOD_FILE (0644).
 	 * @return true|string true; 'exists' (the path was taken — before the claim,
 	 *                     or by a racer who unlinked our entry and took it during
-	 *                     the write); or a sentence saying what refused. On a
-	 *                     refused write our own entry is left EMPTY at the path
+	 *                     the write); 'partial' (the write was short AND the entry
+	 *                     could not be emptied — partial bytes remain at the path
+	 *                     and the caller must keep its recovery state); or a
+	 *                     sentence saying what refused. On a short write that
+	 *                     could be emptied our own entry is left EMPTY at the path
 	 *                     (truncated, never unlinked by pathname) and the sentence
-	 *                     names it.
+	 *                     names it. `last_publish_detail` carries the sentence for
+	 *                     'partial' too.
 	 */
-	private function write_exclusively( $path, $src ) {
-		$mode = defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644;
+	private function write_exclusively( $path, $src, $mode = null ) {
+		$mode = null === $mode ? ( defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644 ) : (int) $mode;
 		$was  = umask( 0777 & ~$mode ); // the mode is decided AT creation, on our inode only
 		$fh   = @fopen( $path, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- 'x' is the no-clobber claim; EEXIST is the expected refusal, classified below.
 		umask( $was );
@@ -514,9 +533,15 @@ class Aura_Worker_Snapshots {
 		if ( ! $written || ! $synced ) {
 			// Our inode, our bytes, incomplete: empty it rather than leave a
 			// truncated file that reads as content. The empty entry stays — it
-			// is removed only by inode-verified paths, never by name.
-			ftruncate( $fh, 0 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_ftruncate
+			// is removed only by inode-verified paths, never by name. When even
+			// the emptying is refused, the partial bytes are a fact the caller
+			// must keep recovery state for (Codex #97 round-3 P2).
+			$emptied = $this->truncate_to_empty( $fh );
 			fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+			if ( ! $emptied ) {
+				$this->last_publish_detail = 'the write into the claimed target was short and the entry could not be emptied' . ( $still_ours ? '; partial bytes remain at ' . $path : '' );
+				return 'partial';
+			}
 			return 'the write into the claimed target was short' . ( $still_ours ? '; an empty file remains at ' . $path : '' );
 		}
 		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
@@ -527,6 +552,17 @@ class Aura_Worker_Snapshots {
 			return self::path_present( $path ) ? 'exists' : 'the target was removed during the write';
 		}
 		return true;
+	}
+
+	/**
+	 * Empty our own inode after a short write. Seam: a test models a
+	 * filesystem that refuses the truncation.
+	 *
+	 * @param resource $fh Open handle we own.
+	 * @return bool
+	 */
+	protected function truncate_to_empty( $fh ) {
+		return (bool) ftruncate( $fh, 0 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_ftruncate
 	}
 
 	/**
@@ -1232,7 +1268,8 @@ class Aura_Worker_Snapshots {
 		if ( false === $src ) {
 			return 'the claimed file could not be read';
 		}
-		$out = $this->write_exclusively( $target, $src );
+		$st  = fstat( $src );
+		$out = $this->write_exclusively( $target, $src, is_array( $st ) ? ( $st['mode'] & 0777 ) : null ); // the file comes back with the mode it had (Codex #97 round-3 P2)
 		fclose( $src ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
 		return $out;
 	}

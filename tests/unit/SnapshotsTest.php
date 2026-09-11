@@ -1322,6 +1322,64 @@ final class SnapshotsTest extends TestCase {
 		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ), 'the changed bytes are kept, not deleted' );
 	}
 
+	public function test_without_link_a_changed_file_comes_back_with_the_mode_it_had(): void {
+		// Codex #97 round-3 P2: a 0600 file must not come back 0644.
+		$file  = WP_CONTENT_DIR . '/nolinkback-mode.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			public $allow_link = true;
+			protected function link_available() {
+				return $this->allow_link;
+			}
+		};
+		$rec = $snaps->create_file( $file, "a\n" )['snapshot'];
+		file_put_contents( $file, "edited\n" );
+		chmod( $file, 0600 );
+		$snaps->allow_link = false;
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertArrayNotHasKey( 'moved_aside', $restore );
+		$this->assertSame( "edited\n", file_get_contents( $file ) );
+		$this->assertSame( 0600, fileperms( $file ) & 0777, 'the claim\'s mode, not FS_CHMOD_FILE' );
+	}
+
+	public function test_without_link_a_short_write_whose_partial_bytes_cannot_be_emptied_keeps_the_record_voided_and_the_stage(): void {
+		// Codex #97 round-3 P2: ftruncate() refused too — partial bytes stay at
+		// the path. abandon_create() must NOT throw the recovery state away:
+		// the record is voided in place (restore can never delete the file),
+		// marked interrupted, and the staged bytes are kept.
+		$file  = WP_CONTENT_DIR . '/nolink-partial.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function link_available() {
+				return false;
+			}
+			protected function write_all( $fh, $src ) {
+				fwrite( $fh, fread( $src, 5 ) );
+				return false;
+			}
+			protected function truncate_to_empty( $fh ) {
+				return false;
+			}
+		};
+
+		$res = $snaps->create_file( $file, "<?php echo 'never';\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'unsupported_filesystem', $res['error'] );
+		$this->assertStringContainsString( 'partial bytes remain', $res['detail'] );
+		$this->assertSame( '<?php', file_get_contents( $file ), 'the partial bytes, untouched by name' );
+		$recs = $snaps->list_snapshots();
+		$this->assertCount( 1, $recs );
+		$this->assertSame( $recs[0]['id'], $res['stale_record'] );
+		$this->assertTrue( $recs[0]['voided'] );
+		$this->assertTrue( $recs[0]['interrupted'] );
+		$this->assertArrayNotHasKey( 'expected_sha256', $recs[0] );
+		$this->assertCount( 1, glob( WP_CONTENT_DIR . '/.aura-create-*' ), 'the staged bytes are kept for the repair' );
+		$this->assertFalse( $snaps->restore( $recs[0]['id'] )['success'] );
+		$this->assertSame( '<?php', file_get_contents( $file ), 'never deleted by a restore' );
+	}
+
 	public function test_without_link_a_short_put_back_write_keeps_the_file_aside_and_leaves_our_empty_entry(): void {
 		$file  = WP_CONTENT_DIR . '/nolinkback-short.php';
 		$snaps = new class extends Aura_Worker_Snapshots {
