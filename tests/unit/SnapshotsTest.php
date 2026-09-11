@@ -741,6 +741,66 @@ final class SnapshotsTest extends TestCase {
 		$this->assertSame( "mine\n", file_get_contents( $file ), 'the winner\'s file is untouched' );
 	}
 
+	public function test_a_record_whose_sync_is_refused_and_whose_unlink_is_refused_is_voided_never_restorable(): void {
+		// Codex #94 round-7 P2: the sync-refusal exit removed the record with
+		// an unchecked unlink; when that unlink is refused too, a fully
+		// restorable `existed: false` record with the expected hash survived.
+		// A later creator landing the same bytes at the target would then lose
+		// its file to a restore of this orphan. Every post-record exit now voids.
+		$file  = WP_CONTENT_DIR . '/unsynced.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function sync_create_record( $meta_path ) {
+				$GLOBALS['_wp_delete_file_fail'] = $meta_path; // and the record's unlink is refused
+				return false; // the kernel refuses the sync
+			}
+		};
+
+		$res = $snaps->create_file( $file, "same\n" );
+		unset( $GLOBALS['_wp_delete_file_fail'] );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'sync', $res['error'] );
+		$this->assertArrayNotHasKey( 'stale_record', $res, 'the record was voided, not left restorable' );
+		$this->assertFileDoesNotExist( $file, 'nothing created' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+		$recs = $snaps->list_snapshots();
+		$this->assertCount( 1, $recs );
+		$this->assertTrue( $recs[0]['voided'] );
+		$this->assertArrayNotHasKey( 'expected_sha256', $recs[0] );
+
+		file_put_contents( $file, "same\n" ); // another creator lands the same bytes later
+		$restore = $snaps->restore( $recs[0]['id'] );
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( "same\n", file_get_contents( $file ), 'the later creator\'s file is untouched' );
+	}
+
+	public function test_a_changed_file_relinked_but_whose_claim_cannot_be_removed_is_reported(): void {
+		// Codex #94 round-7 P2: the file was put back at its path, but the
+		// claim name (a second hard link to the same inode) could not be
+		// removed. `.aura-restore-*` is never swept, so the answer must name
+		// it, as the matching-hash branch already does — otherwise each such
+		// restore leaves one more unreported directory entry.
+		$file  = WP_CONTENT_DIR . '/relinked.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function after_claim( $claim, $target ) {
+				$GLOBALS['_wp_delete_file_fail'] = $claim;
+			}
+		};
+		$rec = $snaps->create_file( $file, "agent\n" )['snapshot'];
+		file_put_contents( $file, "edited\n" );
+
+		$restore = $snaps->restore( $rec['id'] );
+		unset( $GLOBALS['_wp_delete_file_fail'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertSame( "edited\n", file_get_contents( $file ), 'put back at its path' );
+		$this->assertArrayHasKey( 'moved_aside', $restore, 'the leftover claim is named' );
+		$this->assertMatchesRegularExpression( '/\/\.aura-restore-[0-9a-f]{16}$/', $restore['moved_aside'] );
+		$this->assertFileExists( $restore['moved_aside'] );
+		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ), 'the same inode under its claim name' );
+	}
+
 	public function test_redact_strips_every_local_path_and_the_api_listing_uses_it(): void {
 		// Codex #94 round-5 P3: GET /aura/v2/snapshots returned list_snapshots()
 		// verbatim, staged included.

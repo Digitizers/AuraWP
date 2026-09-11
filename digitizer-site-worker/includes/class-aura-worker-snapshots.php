@@ -261,10 +261,8 @@ class Aura_Worker_Snapshots {
 		// record's and the target's directory entries are outside this
 		// guarantee — a crash in that window is the same class the staged-name
 		// sweep and prune_older_than() already recover from.
-		if ( ! $this->sync_file( $record['meta_path'] ) ) {
-			$this->discard_stage( $tmp );
-			$this->delete_record_file( $record['id'] );
-			return array( 'success' => false, 'error' => 'Unable to sync the snapshot record to disk; nothing created.' );
+		if ( ! $this->sync_create_record( $record['meta_path'] ) ) {
+			return $this->abandon_create( $tmp, $record['id'], 'Unable to sync the snapshot record to disk; nothing created.' );
 		}
 		// The record is RE-READ before anything is published (Codex round-1
 		// P1): a short metadata write is the one failure persist() reported as
@@ -278,25 +276,13 @@ class Aura_Worker_Snapshots {
 			|| ( $back['expected_sha256'] ?? null ) !== $sha
 			|| ( $back['staged'] ?? null ) !== $tmp
 		) {
-			$this->discard_stage( $tmp );
-			$this->delete_record_file( $record['id'] );
-			return array( 'success' => false, 'error' => 'Snapshot record did not read back complete (disk full?); nothing created.' );
+			return $this->abandon_create( $tmp, $record['id'], 'Snapshot record did not read back complete (disk full?); nothing created.' );
 		}
 
 		// 3. Publish: atomic, no-clobber.
 		$published = $this->publish( $tmp, $path );
 		if ( true !== $published ) {
-			$this->discard_stage( $tmp );
-			// The record of a create that did NOT happen must not survive as a
-			// restorable one (Codex #94 round-5 P2): a winner that landed the
-			// same bytes — concurrent identical creates are the common race —
-			// would pass its hash check and lose its file to a restore of this
-			// orphan. Remove the record, and when the unlink is refused, VOID it
-			// in place so restore refuses it.
-			$out = array( 'success' => false, 'error' => (string) $published );
-			if ( ! $this->void_create_record( $record['id'] ) ) {
-				$out['stale_record'] = $record['id'];
-			}
+			$out = $this->abandon_create( $tmp, $record['id'], (string) $published );
 			if ( isset( $this->last_publish_detail ) && '' !== $this->last_publish_detail ) {
 				$out['detail'] = $this->last_publish_detail;
 			}
@@ -463,6 +449,42 @@ class Aura_Worker_Snapshots {
 	 */
 	protected function link_available() {
 		return function_exists( 'link' );
+	}
+
+	/**
+	 * Refuse a create after its record was written. Discards the staged file
+	 * and retires the record — every exit after persist_create_record() goes
+	 * through here, because the record of a create that did NOT happen must
+	 * not survive as a restorable one (Codex #94 round-5 P2, round-7 P2): a
+	 * later creator that lands the same bytes at the target — concurrent
+	 * identical creates are the common race — would pass the hash check and
+	 * lose its file to a restore of this orphan. The record is removed, and
+	 * when the unlink is refused it is VOIDED in place so restore refuses it;
+	 * only when even that fails is `stale_record` reported.
+	 *
+	 * @param string $tmp   The staged file.
+	 * @param string $id    The record id.
+	 * @param string $error The refusal.
+	 * @return array { success: false, error: string, stale_record?: string }
+	 */
+	private function abandon_create( $tmp, $id, $error ) {
+		$this->discard_stage( $tmp );
+		$out = array( 'success' => false, 'error' => $error );
+		if ( ! $this->void_create_record( $id ) ) {
+			$out['stale_record'] = $id;
+		}
+		return $out;
+	}
+
+	/**
+	 * Seam: flush the create record to disk. A test models a kernel that
+	 * refuses the sync.
+	 *
+	 * @param string $meta_path The record file.
+	 * @return bool
+	 */
+	protected function sync_create_record( $meta_path ) {
+		return $this->sync_file( $meta_path );
 	}
 
 	/**
@@ -961,6 +983,12 @@ class Aura_Worker_Snapshots {
 		// attempted at the target and, as on every path here, nothing is deleted.
 		if ( $this->link_available() && @link( $claim, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is the expected refusal, classified below.
 			wp_delete_file( $claim ); // the second name to the same inode; the file is back at its path
+			if ( file_exists( $claim ) ) {
+				// The file is back, but its claim name could not be removed and
+				// `.aura-restore-*` is never swept: say where it is, as the
+				// matching-hash branch does (Codex #94 round-7 P2).
+				$out['moved_aside'] = $claim;
+			}
 		} else {
 			$out['moved_aside'] = $claim;
 		}
