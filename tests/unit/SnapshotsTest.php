@@ -1253,6 +1253,79 @@ final class SnapshotsTest extends TestCase {
 		$this->assertTrue( $snaps->list_snapshots()[0]['voided'] );
 	}
 
+	public function test_a_record_voided_by_a_concurrent_sweep_during_a_long_write_is_reinstated_when_the_publish_lands(): void {
+		// Codex #97 round-5 P2: a publish past STAGE_MAX_AGE looks interrupted to
+		// a sweep in another request, which voids the record mid-write. The
+		// publisher, whose bytes landed and whose inode verified, repairs it.
+		$file  = WP_CONTENT_DIR . '/long-write.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function link_available() {
+				return false;
+			}
+			protected function during_write( $path ) {
+				foreach ( $this->list_snapshots() as $rec ) {
+					if ( ( $rec['target'] ?? '' ) === $path ) {
+						$this->void_record_in_place( $rec['id'], array( 'interrupted' => true ) ); // what the sweep did
+					}
+				}
+			}
+		};
+
+		$res = $snaps->create_file( $file, "<?php // slow\n" );
+
+		$this->assertTrue( $res['success'] );
+		$this->assertArrayNotHasKey( 'warning', $res );
+		$rec = $snaps->get( $res['snapshot']['id'] );
+		$this->assertArrayNotHasKey( 'voided', $rec );
+		$this->assertArrayNotHasKey( 'interrupted', $rec );
+		$this->assertSame( hash( 'sha256', "<?php // slow\n" ), $rec['expected_sha256'] );
+		$this->assertTrue( $snaps->restore( $rec['id'] )['success'], 'restorable again' );
+		$this->assertFileDoesNotExist( $file );
+	}
+
+	public function test_without_link_a_create_mode_with_execute_bits_is_refused_not_stripped(): void {
+		// Codex #97 round-5 P2: FS_CHMOD_FILE 0755 exists on some hosts; fopen()
+		// cannot recreate the execute bits, so the create refuses like the
+		// put-back does instead of landing a lesser file.
+		$file  = WP_CONTENT_DIR . '/exec-mode.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function link_available() {
+				return false;
+			}
+			protected function create_mode() {
+				return 0755;
+			}
+		};
+
+		$res = $snaps->create_file( $file, "x\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'unsupported_filesystem', $res['error'] );
+		$this->assertStringContainsString( 'execute bits', $res['detail'] );
+		$this->assertFileDoesNotExist( $file );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+		$this->assertSame( array(), $snaps->list_snapshots() );
+	}
+
+	public function test_with_link_a_create_mode_with_execute_bits_is_honoured(): void {
+		$file  = WP_CONTENT_DIR . '/exec-mode-link.sh';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function create_mode() {
+				return 0755;
+			}
+			protected function secure_stage( $tmp ) {
+				return (bool) @chmod( $tmp, $this->create_mode() );
+			}
+		};
+		if ( ! function_exists( 'link' ) ) {
+			$this->markTestSkipped( 'link() unavailable.' );
+		}
+		$res = $snaps->create_file( $file, "#!/bin/sh\n" );
+		$this->assertTrue( $res['success'] );
+		$this->assertSame( 'link', $res['published'] );
+		$this->assertSame( 0755, fileperms( $file ) & 0777 );
+	}
+
 	public function test_a_completed_publish_whose_stage_cleanup_was_lost_keeps_its_record(): void {
 		$file  = WP_CONTENT_DIR . '/lost-cleanup.php';
 		$snaps = new class extends Aura_Worker_Snapshots {

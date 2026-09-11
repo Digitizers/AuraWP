@@ -306,11 +306,26 @@ class Aura_Worker_Snapshots {
 		// and prune_older_than() remove what is left.
 		$this->discard_stage( $tmp );
 
+		// A publish that ran past STAGE_MAX_AGE (a large file on slow storage)
+		// looks interrupted to a concurrent sweep, which voids the record while
+		// we are still writing (Codex #97 round-5 P2). The bytes landed and the
+		// inode was verified, so the truth is ours to restore: put the hash
+		// back and lift the void. If even that fails the create still happened
+		// — say so instead of pretending it did not.
+		$out     = array( 'success' => true, 'published' => $this->last_publish_mode );
+		$current = $this->get( $record['id'] );
+		if ( is_array( $current ) && ! empty( $current['voided'] ) ) {
+			if ( ! $this->reinstate_record( $record['id'], $sha ) ) {
+				$out['warning'] = 'the record was voided by a concurrent sweep during a long publish and could not be repaired; restore will refuse it';
+			}
+		}
+
 		// The PERSISTED record keeps `staged` — prune_older_than()'s sweep reads
 		// it from list_snapshots() — but the RETURNED one carries no local path
 		// at all (Codex #94 round-6 P3): step 4 deleted the staged file, and
 		// `meta_path` is this site's directory, not a fact about the snapshot.
-		return array( 'success' => true, 'published' => $this->last_publish_mode, 'snapshot' => self::redact( $record ) );
+		$out['snapshot'] = self::redact( $record );
+		return $out;
 	}
 
 	/** The last publish() failure's PHP message, for the caller's `detail`. */
@@ -473,6 +488,14 @@ class Aura_Worker_Snapshots {
 	 * @return true|string As publish().
 	 */
 	private function publish_by_write( $tmp, $path ) {
+		$mode = $this->create_mode();
+		if ( 0 !== ( $mode & 0111 ) ) {
+			// fopen() creates from 0666 and a umask only removes bits: a site whose
+			// FS_CHMOD_FILE carries execute bits (0755 hosts exist) would get a
+			// silently lesser file. Refuse, as the put-back does (Codex #97 round-5).
+			$this->last_publish_detail = sprintf( 'link() is disabled on this host and FS_CHMOD_FILE (%o) has execute bits that fopen() cannot recreate', $mode );
+			return 'unsupported_filesystem';
+		}
 		$src = @fopen( $tmp, 'rb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Our own staged file; a refusal is answered below.
 		if ( false === $src ) {
 			$this->last_publish_detail = 'the staged bytes could not be read back';
@@ -521,7 +544,7 @@ class Aura_Worker_Snapshots {
 	 *                     'partial' too.
 	 */
 	private function write_exclusively( $path, $src, $mode = null ) {
-		$mode = ( null === $mode ? ( defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644 ) : (int) $mode ) & 0666;
+		$mode = ( null === $mode ? $this->create_mode() : (int) $mode ) & 0666; // callers refuse execute bits before reaching here
 		$was  = umask( 0777 & ~$mode ); // the mode is decided AT creation, on our inode only
 		$fh   = @fopen( $path, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- 'x' is the no-clobber claim; EEXIST is the expected refusal, classified below.
 		umask( $was );
@@ -567,6 +590,16 @@ class Aura_Worker_Snapshots {
 	 */
 	protected function truncate_to_empty( $fh ) {
 		return (bool) ftruncate( $fh, 0 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_ftruncate
+	}
+
+	/**
+	 * The mode a fresh create should carry: FS_CHMOD_FILE, or 0644 without it.
+	 * Seam: a test models a host that configures execute bits.
+	 *
+	 * @return int
+	 */
+	protected function create_mode() {
+		return defined( 'FS_CHMOD_FILE' ) ? (int) FS_CHMOD_FILE : 0644;
 	}
 
 	/**
@@ -756,6 +789,30 @@ class Aura_Worker_Snapshots {
 			return false;
 		}
 		$n = @file_put_contents( $meta_path, $json ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- The record file this class owns; a refusal is answered to the caller, not surfaced as a warning.
+		return false !== $n && $n === strlen( $json ) && $this->sync_file( $meta_path );
+	}
+
+	/**
+	 * Lift a void a concurrent sweep put on a record whose publish did land:
+	 * the expected hash goes back, `voided` and `interrupted` go.
+	 *
+	 * @param string $id  Snapshot id.
+	 * @param string $sha The published content's sha256.
+	 * @return bool
+	 */
+	private function reinstate_record( $id, $sha ) {
+		$meta_path = $this->dir . basename( (string) $id ) . '.json';
+		$record    = $this->get( $id );
+		if ( ! is_array( $record ) ) {
+			return false;
+		}
+		unset( $record['voided'], $record['interrupted'] );
+		$record['expected_sha256'] = $sha;
+		$json                      = wp_json_encode( $record );
+		if ( false === $json ) {
+			return false;
+		}
+		$n = @file_put_contents( $meta_path, $json ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- The record file this class owns; a refusal is answered to the caller.
 		return false !== $n && $n === strlen( $json ) && $this->sync_file( $meta_path );
 	}
 
