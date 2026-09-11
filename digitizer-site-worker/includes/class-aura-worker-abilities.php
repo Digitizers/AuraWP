@@ -94,7 +94,7 @@ class Aura_Worker_Abilities {
 					'label'               => $this->labelize( $name ),
 					'description'         => isset( $meta['description'] ) ? $meta['description'] : $name,
 					'category'            => 'site-management',
-					'input_schema'        => $this->build_input_schema( isset( $meta['parameters'] ) ? $meta['parameters'] : array() ),
+					'input_schema'        => $this->build_input_schema( isset( $meta['parameters'] ) ? (array) $meta['parameters'] : array() ),
 					'execute_callback'    => $this->make_executor( $name ),
 					'permission_callback' => $this->make_permission( $name, $ann ),
 					'meta'                => array(

@@ -2371,8 +2371,8 @@ class Aura_Worker_Rules {
 
 	/**
 	 * The tool-result array for a refusal. Says plainly that approval does not
-	 * help — the operator has to release the rule — so nobody goes looking for
-	 * a grant bug.
+	 * help — the operator scopes the rule out of this site with `sites`, or
+	 * releases it — so nobody goes looking for a grant bug.
 	 *
 	 * @param string $tool_name Tool.
 	 * @param array  $rule      Deciding rule.
@@ -2386,7 +2386,7 @@ class Aura_Worker_Rules {
 			'code'    => 'aura_rule_blocked',
 			'status'  => 403,
 			'error'   => sprintf(
-				'%s is blocked by %s%s — approval does not override a rule; release the rule first.',
+				'%s is blocked by %s%s — approval does not override a rule; scope the rule out of this site with `sites`, or release it.',
 				(string) $tool_name,
 				$key,
 				'' === $reason ? '' : ' (' . $reason . ')'

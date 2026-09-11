@@ -554,6 +554,561 @@ final class SnapshotsTest extends TestCase {
 		$this->assertTrue( $snaps->restore( $s2['snapshot']['id'] )['success'] );
 		$this->assertSame( array( 'n' => 1, 'deep' => array( 'x', 'y' ) ), get_option( 'array_opt' ) );
 	}
+
+	// --- create_file (P4.6 piece 2) -----------------------------------------
+
+	public function test_create_file_creates_and_its_record_restores_by_unlinking(): void {
+		$snaps = new Aura_Worker_Snapshots();
+		$file  = WP_CONTENT_DIR . '/new.php';
+
+		$res = $snaps->create_file( $file, "<?php // agent\n" );
+
+		$this->assertTrue( $res['success'], $res['error'] ?? '' );
+		$this->assertFileExists( $file );
+		$this->assertSame( "<?php // agent\n", file_get_contents( $file ) );
+		$rec = $res['snapshot'];
+		$this->assertSame( 'file', $rec['kind'] );
+		$this->assertFalse( $rec['existed'] );
+		$this->assertSame( hash( 'sha256', "<?php // agent\n" ), $rec['expected_sha256'] );
+		$this->assertArrayNotHasKey( 'payload_path', $rec, 'a created file has no payload — the record undoes content at a path' );
+		$this->assertArrayNotHasKey( 'staged', $rec, 'the returned record carries no local path' );
+		$this->assertArrayNotHasKey( 'meta_path', $rec, 'nor the record file\'s own path' );
+		$this->assertFileDoesNotExist( $snaps->get( $rec['id'] )['staged'], 'the staged file is removed after publish' );
+		$this->assertSame( 0644, fileperms( $file ) & 0777, 'the created file does not inherit the umask' );
+
+		$restore = $snaps->restore( $rec['id'] );
+		$this->assertTrue( $restore['success'] );
+		$this->assertFileDoesNotExist( $file );
+	}
+
+	public function test_created_file_edited_after_the_create_is_refused_on_restore(): void {
+		$snaps = new Aura_Worker_Snapshots();
+		$file  = WP_CONTENT_DIR . '/new.php';
+		$rec   = $snaps->create_file( $file, "a\n" )['snapshot'];
+		file_put_contents( $file, "b\n" );
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertFileExists( $file, 'different bytes are never deleted' );
+	}
+
+	public function test_created_file_deleted_and_recreated_with_identical_bytes_is_unlinked_on_restore(): void {
+		// The §2 ruling, asserted on purpose: identical content at the path IS
+		// what this record exists to remove, whoever re-created it. No inode.
+		$snaps = new Aura_Worker_Snapshots();
+		$file  = WP_CONTENT_DIR . '/new.php';
+		$rec   = $snaps->create_file( $file, "same\n" )['snapshot'];
+		unlink( $file );
+		file_put_contents( $file, "same\n" );
+
+		$this->assertTrue( $snaps->restore( $rec['id'] )['success'] );
+		$this->assertFileDoesNotExist( $file );
+	}
+
+	public function test_a_dangling_symlink_at_the_created_path_is_reported_never_treated_as_gone(): void {
+		// Codex #94 round-2 P2: file_exists() answers false for a dangling
+		// symlink, so the restore used to report success and leave a directory
+		// entry that goes live the moment its destination appears.
+		$snaps = new Aura_Worker_Snapshots();
+		$file  = WP_CONTENT_DIR . '/new.php';
+		$rec   = $snaps->create_file( $file, "x\n" )['snapshot'];
+		unlink( $file );
+		symlink( WP_CONTENT_DIR . '/does-not-exist.php', $file );
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertStringContainsString( 'not a regular file', $restore['error'] );
+		$this->assertTrue( is_link( $file ), 'the symlink is reported, never deleted' );
+	}
+
+	public function test_restoring_a_created_file_that_is_already_gone_succeeds(): void {
+		$snaps = new Aura_Worker_Snapshots();
+		$file  = WP_CONTENT_DIR . '/new.php';
+		$rec   = $snaps->create_file( $file, "x\n" )['snapshot'];
+		unlink( $file );
+
+		$this->assertTrue( $snaps->restore( $rec['id'] )['success'] );
+	}
+
+	public function test_restore_claims_the_path_before_verifying_so_a_file_that_arrives_after_the_claim_is_never_touched(): void {
+		// Codex #91 round-1 P1: hash-then-unlink had a window in which another
+		// process could replace the target and lose unverified bytes. The
+		// restore renames the target to an opaque claim first (atomic, same
+		// inode), verifies THAT file, and deletes only it.
+		$file  = WP_CONTENT_DIR . '/race.php';
+		$snaps = new class( $file ) extends Aura_Worker_Snapshots {
+			private $file;
+			public function __construct( $file ) { parent::__construct(); $this->file = $file; }
+			protected function after_claim( $claim, $target ) {
+				file_put_contents( $this->file, "a concurrent writer's new file\n" ); // lands at the path AFTER our claim
+			}
+		};
+		$rec = $snaps->create_file( $file, "agent\n" )['snapshot'];
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertTrue( $restore['success'], 'the agent bytes were verified on the claimed file and removed' );
+		$this->assertSame( "a concurrent writer's new file\n", file_get_contents( $file ), 'the newcomer at the path is untouched' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-restore-*' ), 'no claim file left behind' );
+	}
+
+	public function test_restore_puts_a_changed_file_back_and_answers_file_changed_since(): void {
+		$file  = WP_CONTENT_DIR . '/edited.php';
+		$snaps = new Aura_Worker_Snapshots();
+		$rec   = $snaps->create_file( $file, "agent\n" )['snapshot'];
+		file_put_contents( $file, "edited by a human\n" );
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertArrayNotHasKey( 'moved_aside', $restore );
+		$this->assertSame( "edited by a human\n", file_get_contents( $file ), 'put back at its path, same bytes' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-restore-*' ) );
+	}
+
+	public function test_a_changed_file_whose_path_was_retaken_in_the_window_is_kept_aside_and_named(): void {
+		// The one outcome that cannot be undone silently: the claimed file is
+		// NOT the agent's bytes, and something else took the path while it was
+		// claimed. Nothing is deleted; the changed file stays beside the target
+		// under its claim name, and the answer says where.
+		$file  = WP_CONTENT_DIR . '/retaken.php';
+		$snaps = new class( $file ) extends Aura_Worker_Snapshots {
+			private $file;
+			public function __construct( $file ) { parent::__construct(); $this->file = $file; }
+			protected function after_claim( $claim, $target ) {
+				file_put_contents( $this->file, "newcomer\n" );
+			}
+		};
+		$rec = $snaps->create_file( $file, "agent\n" )['snapshot'];
+		file_put_contents( $file, "edited\n" );
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertMatchesRegularExpression( '/\/\.aura-restore-[0-9a-f]{16}$/', $restore['moved_aside'] );
+		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ), 'the changed bytes are kept, not deleted' );
+		$this->assertSame( "newcomer\n", file_get_contents( $file ), 'the newcomer is untouched' );
+		$this->assertStringNotContainsString( '.php', basename( $restore['moved_aside'] ) );
+	}
+
+	public function test_create_file_refuses_an_existing_target_before_touching_anything(): void {
+		$snaps = new Aura_Worker_Snapshots();
+		$file  = WP_CONTENT_DIR . '/taken.php';
+		file_put_contents( $file, "theirs\n" );
+
+		$res = $snaps->create_file( $file, "mine\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'exists', $res['error'] );
+		$this->assertSame( "theirs\n", file_get_contents( $file ) );
+		$this->assertSame( array(), $snaps->list_snapshots(), 'no record for a create that did not happen' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ), 'no staged file left' );
+	}
+
+	public function test_a_lost_race_whose_record_cannot_be_unlinked_is_voided_so_it_never_restores_over_the_winner(): void {
+		// Codex #94 round-5 P2: the winner landed the SAME bytes, so a
+		// restorable orphan record would pass its hash check and delete the
+		// winner's file. When the record's unlink is refused it is voided in
+		// place instead (no expected_sha256), and restore refuses it.
+		$file  = WP_CONTENT_DIR . '/race.php';
+		$snaps = new class( $file ) extends Aura_Worker_Snapshots {
+			private $race;
+			public function __construct( $race ) { parent::__construct(); $this->race = $race; }
+			protected function publish( $tmp, $path ) {
+				file_put_contents( $this->race, "mine\n" ); // the winner wrote identical bytes first
+				$GLOBALS['_wp_delete_file_fail'] = WP_CONTENT_DIR . '/aura-backups/snapshots/' . $this->list_snapshots()[0]['id'] . '.json'; // and our record's unlink is refused
+				return parent::publish( $tmp, $path );
+			}
+		};
+
+		$res = $snaps->create_file( $file, "mine\n" );
+		unset( $GLOBALS['_wp_delete_file_fail'] );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'exists', $res['error'] );
+		$this->assertArrayNotHasKey( 'stale_record', $res, 'the record was voided, not left restorable' );
+		$recs = $snaps->list_snapshots();
+		$this->assertCount( 1, $recs );
+		$this->assertTrue( $recs[0]['voided'] );
+		$this->assertArrayNotHasKey( 'expected_sha256', $recs[0] );
+		$restore = $snaps->restore( $recs[0]['id'] );
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( "mine\n", file_get_contents( $file ), 'the winner\'s file is untouched' );
+	}
+
+	public function test_a_record_whose_sync_is_refused_and_whose_unlink_is_refused_is_voided_never_restorable(): void {
+		// Codex #94 round-7 P2: the sync-refusal exit removed the record with
+		// an unchecked unlink; when that unlink is refused too, a fully
+		// restorable `existed: false` record with the expected hash survived.
+		// A later creator landing the same bytes at the target would then lose
+		// its file to a restore of this orphan. Every post-record exit now voids.
+		$file  = WP_CONTENT_DIR . '/unsynced.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function sync_create_record( $meta_path ) {
+				$GLOBALS['_wp_delete_file_fail'] = $meta_path; // and the record's unlink is refused
+				return false; // the kernel refuses the sync
+			}
+		};
+
+		$res = $snaps->create_file( $file, "same\n" );
+		unset( $GLOBALS['_wp_delete_file_fail'] );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'sync', $res['error'] );
+		$this->assertArrayNotHasKey( 'stale_record', $res, 'the record was voided, not left restorable' );
+		$this->assertFileDoesNotExist( $file, 'nothing created' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+		$recs = $snaps->list_snapshots();
+		$this->assertCount( 1, $recs );
+		$this->assertTrue( $recs[0]['voided'] );
+		$this->assertArrayNotHasKey( 'expected_sha256', $recs[0] );
+
+		file_put_contents( $file, "same\n" ); // another creator lands the same bytes later
+		$restore = $snaps->restore( $recs[0]['id'] );
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( "same\n", file_get_contents( $file ), 'the later creator\'s file is untouched' );
+	}
+
+	public function test_a_changed_file_relinked_but_whose_claim_cannot_be_removed_is_reported(): void {
+		// Codex #94 round-7 P2: the file was put back at its path, but the
+		// claim name (a second hard link to the same inode) could not be
+		// removed. `.aura-restore-*` is never swept, so the answer must name
+		// it, as the matching-hash branch already does — otherwise each such
+		// restore leaves one more unreported directory entry.
+		$file  = WP_CONTENT_DIR . '/relinked.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function after_claim( $claim, $target ) {
+				$GLOBALS['_wp_delete_file_fail'] = $claim;
+			}
+		};
+		$rec = $snaps->create_file( $file, "agent\n" )['snapshot'];
+		file_put_contents( $file, "edited\n" );
+
+		$restore = $snaps->restore( $rec['id'] );
+		unset( $GLOBALS['_wp_delete_file_fail'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertSame( "edited\n", file_get_contents( $file ), 'put back at its path' );
+		$this->assertArrayHasKey( 'moved_aside', $restore, 'the leftover claim is named' );
+		$this->assertMatchesRegularExpression( '/\/\.aura-restore-[0-9a-f]{16}$/', $restore['moved_aside'] );
+		$this->assertFileExists( $restore['moved_aside'] );
+		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ), 'the same inode under its claim name' );
+	}
+
+	public function test_redact_strips_every_local_path_and_the_api_listing_uses_it(): void {
+		// Codex #94 round-5 P3: GET /aura/v2/snapshots returned list_snapshots()
+		// verbatim, staged included.
+		$snaps = new Aura_Worker_Snapshots();
+		$snaps->create_file( WP_CONTENT_DIR . '/r.php', "x\n" );
+		$stored = $snaps->list_snapshots()[0];
+		$this->assertArrayHasKey( 'staged', $stored, 'the persisted record keeps it for the sweep' );
+
+		$public = Aura_Worker_Snapshots::redact( $stored );
+
+		$this->assertArrayNotHasKey( 'staged', $public );
+		$this->assertArrayNotHasKey( 'meta_path', $public );
+		$this->assertArrayNotHasKey( 'payload_path', $public );
+		$this->assertSame( $stored['id'], $public['id'] );
+		$this->assertStringContainsString( "array_map( array( 'Aura_Worker_Snapshots', 'redact' ), \$snapshots->list_snapshots() )", file_get_contents( SA_PLUGIN_DIR . '/includes/class-aura-worker-api.php' ), 'the REST listing passes every record through redact()' );
+	}
+
+	public function test_target_appearing_between_stage_and_publish_is_exists_with_nothing_left_behind(): void {
+		$file  = WP_CONTENT_DIR . '/race.php';
+		$snaps = new class( $file ) extends Aura_Worker_Snapshots {
+			private $race;
+			public function __construct( $race ) { parent::__construct(); $this->race = $race; }
+			protected function publish( $tmp, $path ) {
+				file_put_contents( $this->race, "theirs\n" ); // the race: someone lands the target first
+				return parent::publish( $tmp, $path );
+			}
+		};
+
+		$res = $snaps->create_file( $file, "mine\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'exists', $res['error'] );
+		$this->assertSame( "theirs\n", file_get_contents( $file ), 'link() never clobbers' );
+		$this->assertSame( array(), $snaps->list_snapshots(), 'the record is deleted when publish is refused' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+	}
+
+	public function test_record_persist_failure_leaves_no_staged_file_and_no_target(): void {
+		$file  = WP_CONTENT_DIR . '/np.php';
+		$snaps = new Aura_Worker_Snapshots();
+		// Make the snapshot directory unwritable AFTER construction, so
+		// persist() fails while staging (beside the target) still works.
+		chmod( WP_CONTENT_DIR . '/aura-backups/snapshots', 0555 );
+		if ( is_writable( WP_CONTENT_DIR . '/aura-backups/snapshots' ) ) {
+			chmod( WP_CONTENT_DIR . '/aura-backups/snapshots', 0755 );
+			$this->markTestSkipped( 'running as a user that ignores directory modes (root)' );
+		}
+		try {
+			$res = $snaps->create_file( $file, "x\n" );
+		} finally {
+			chmod( WP_CONTENT_DIR . '/aura-backups/snapshots', 0755 );
+		}
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'persist', $res['error'] );
+		$this->assertFileDoesNotExist( $file );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+	}
+
+	public function test_a_record_that_does_not_read_back_complete_is_never_published(): void {
+		// Codex round-1 P1: persist() used to accept any file_put_contents()
+		// result but literal false, so a short .json write (disk full during
+		// the metadata write) "succeeded" and the target was published with
+		// no usable rollback point. create_file() re-reads the record before
+		// publish; a record that does not decode to the same facts refuses.
+		$file  = WP_CONTENT_DIR . '/unverified.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function persist_create_record( array $meta ) {
+				$record = parent::persist_create_record( $meta );
+				if ( false !== $record ) {
+					// Model the short write persist() did not see: truncate the .json it wrote.
+					file_put_contents( $record['meta_path'], substr( (string) file_get_contents( $record['meta_path'] ), 0, 10 ) );
+				}
+				return $record;
+			}
+		};
+
+		$res = $snaps->create_file( $file, "x\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'read back', $res['error'] );
+		$this->assertFileDoesNotExist( $file, 'no target without a verified record' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+		$this->assertSame( array(), $snaps->list_snapshots(), 'the truncated record is removed' );
+	}
+
+	public function test_short_write_while_staging_leaves_no_staged_file_no_record_no_target(): void {
+		$file  = WP_CONTENT_DIR . '/short.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function stage( $dir, $name, $content ) {
+				// Model a full disk: the exclusive create succeeded, the bytes did not land.
+				$tmp = $dir . '/.aura-create-shortwrite';
+				file_put_contents( $tmp, substr( $content, 0, 1 ) );
+				return $this->discard_short_stage( $tmp );
+			}
+		};
+
+		$res = $snaps->create_file( $file, "complete content\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'Short write', $res['error'] );
+		$this->assertFileDoesNotExist( $file );
+		$this->assertSame( array(), $snaps->list_snapshots() );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+	}
+
+	public function test_a_staged_file_whose_mode_cannot_be_set_is_never_published(): void {
+		// Codex #94 round-1 P1: a mode that could not be set is a refusal, never
+		// a publish with whatever fopen() and the umask left behind.
+		$file  = WP_CONTENT_DIR . '/nochmod.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function secure_stage( $tmp ) {
+				return false;
+			}
+		};
+
+		$res = $snaps->create_file( $file, "x\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertStringContainsString( 'permissions', $res['error'] );
+		$this->assertFileDoesNotExist( $file, 'nothing at the target' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ), 'the stage is discarded' );
+		$this->assertSame( array(), $snaps->list_snapshots(), 'no record for a create that did not happen' );
+	}
+
+	public function test_link_refused_is_unsupported_filesystem_with_nothing_at_the_target(): void {
+		$file  = WP_CONTENT_DIR . '/nolink.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function publish( $tmp, $path ) {
+				return 'unsupported_filesystem';
+			}
+		};
+
+		$res = $snaps->create_file( $file, "x\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'unsupported_filesystem', $res['error'] );
+		$this->assertFileDoesNotExist( $file );
+		$this->assertSame( array(), $snaps->list_snapshots() );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+	}
+
+	public function test_staged_name_is_never_a_php_name_and_lives_beside_the_target(): void {
+		$file  = WP_CONTENT_DIR . '/sub/agent.php';
+		mkdir( WP_CONTENT_DIR . '/sub' );
+		$snaps = new class extends Aura_Worker_Snapshots {
+			public $seen = '';
+			protected function publish( $tmp, $path ) {
+				$this->seen = $tmp;
+				return parent::publish( $tmp, $path );
+			}
+		};
+
+		$snaps->create_file( $file, "x\n" );
+
+		$this->assertSame( WP_CONTENT_DIR . '/sub', dirname( $snaps->seen ), 'same directory, so link() is on one filesystem' );
+		$this->assertMatchesRegularExpression( '/^\.aura-create-[0-9a-f]{16}$/', basename( $snaps->seen ), 'an opaque name: no part of the target in it' );
+		$this->assertStringNotContainsString( '.php', basename( $snaps->seen ), 'no .php ANYWHERE in the name — Apache AddHandler multi-extension semantics would execute .x.php.y (Codex round-1)' );
+	}
+
+	public function test_a_stray_staged_file_older_than_an_hour_is_swept_by_the_next_create_in_that_directory(): void {
+		$snaps = new Aura_Worker_Snapshots();
+		$stray = WP_CONTENT_DIR . '/.aura-create-deadbeefdeadbeef';
+		file_put_contents( $stray, 'partial' );
+		touch( $stray, time() - 2 * HOUR_IN_SECONDS );
+		$fresh = WP_CONTENT_DIR . '/.aura-create-cafecafecafecafe';
+		file_put_contents( $fresh, 'partial' );
+
+		$snaps->create_file( WP_CONTENT_DIR . '/other.php', "x\n" );
+
+		$this->assertFileDoesNotExist( $stray, 'older than an hour: pruned' );
+		$this->assertFileExists( $fresh, 'a young staged file may belong to a create in flight' );
+	}
+
+	public function test_prune_older_than_removes_a_stale_staged_file_named_by_a_record_and_keeps_the_record(): void {
+		// Crash after the record and before publish: record + staged file,
+		// target absent. The sweep removes the staged bytes; the record stays
+		// (restore on it is "already gone" → success).
+		$file  = WP_CONTENT_DIR . '/crash.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function publish( $tmp, $path ) {
+				throw new RuntimeException( 'simulated crash after record' );
+			}
+		};
+		try {
+			$snaps->create_file( $file, "x\n" );
+		} catch ( RuntimeException $e ) {
+			// expected
+		}
+		$recs = $snaps->list_snapshots();
+		$this->assertCount( 1, $recs );
+		$staged = $recs[0]['staged'];
+		$this->assertFileExists( $staged );
+		touch( $staged, time() - 2 * HOUR_IN_SECONDS );
+
+		$pruned = $snaps->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+
+		$this->assertSame( 0, $pruned, 'file records are never pruned' );
+		$this->assertFileDoesNotExist( $staged );
+		$this->assertCount( 1, $snaps->list_snapshots() );
+		$this->assertTrue( $snaps->restore( $recs[0]['id'] )['success'] );
+	}
+
+	public function test_on_a_network_the_staged_sweep_touches_only_this_blogs_records(): void {
+		// Codex #91 round-4 P2: every blog shares the snapshot directory. A
+		// prune on blog 2 must not delete a staged file recorded by blog 1.
+		$file  = WP_CONTENT_DIR . '/crash.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function publish( $tmp, $path ) {
+				throw new RuntimeException( 'simulated crash after record' );
+			}
+		};
+		$GLOBALS['_is_multisite']     = true;
+		$GLOBALS['_current_blog_id']  = 1;
+		try {
+			$snaps->create_file( $file, "x\n" );
+		} catch ( RuntimeException $e ) {
+			// expected
+		}
+		$staged = $snaps->list_snapshots()[0]['staged'];
+		touch( $staged, time() - 2 * HOUR_IN_SECONDS );
+
+		$GLOBALS['_current_blog_id'] = 2;
+		$snaps->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+		$this->assertFileExists( $staged, 'blog 2 must not sweep blog 1\'s staged bytes' );
+
+		$GLOBALS['_current_blog_id'] = 1;
+		$snaps->prune_older_than( 30, Aura_Worker_Snapshots::DOOR_KINDS );
+		$this->assertFileDoesNotExist( $staged, 'the owning blog sweeps it' );
+	}
+
+	public function test_snapshot_get_never_returns_the_staged_path(): void {
+		require_once SA_PLUGIN_DIR . '/includes/tools/class-tool-snapshot-get.php';
+		$snaps = new Aura_Worker_Snapshots();
+		$rec   = $snaps->create_file( WP_CONTENT_DIR . '/g.php', "x\n" )['snapshot'];
+
+		$out = ( new Aura_Tool_Snapshot_Get() )->execute( array( 'id' => $rec['id'] ) );
+
+		$this->assertTrue( $out['found'] );
+		$this->assertArrayNotHasKey( 'staged', $out['record'] );
+		$this->assertArrayNotHasKey( 'payload_path', $out['record'] );
+		$this->assertNull( $out['payload'] );
+		$this->assertFalse( $out['record']['existed'] );
+	}
+
+	public function test_a_delete_that_fails_after_the_claim_says_where_the_bytes_are(): void {
+		// The claim succeeded, so the target is gone from its path; the unlink
+		// of the claimed file then failed. The answer must name the claim, as
+		// the file_changed_since branch does — otherwise the agent's bytes sit
+		// somewhere nothing ever tells the operator about.
+		$file  = WP_CONTENT_DIR . '/undeletable.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function after_claim( $claim, $target ) {
+				$GLOBALS['_wp_delete_file_fail'] = $claim; // model a directory this process may write but not unlink from
+			}
+		};
+		$rec = $snaps->create_file( $file, "<?php // agent\n" )['snapshot'];
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertStringContainsString( 'Failed to delete file', $restore['error'] );
+		$this->assertArrayHasKey( 'moved_aside', $restore, 'the caller learns where the bytes are' );
+		$this->assertMatchesRegularExpression( '/\/\.aura-restore-[0-9a-f]{16}$/', $restore['moved_aside'] );
+		$this->assertFileExists( $restore['moved_aside'] );
+		$this->assertSame( "<?php // agent\n", file_get_contents( $restore['moved_aside'] ), "the agent's bytes, still on disk" );
+		$this->assertFileDoesNotExist( $file, 'the claim moved it off the path' );
+	}
+
+	public function test_a_host_with_link_disabled_fails_closed_with_nothing_at_the_target(): void {
+		// link() in disable_functions warns and returns null. Without the
+		// explicit guard that reads as an ordinary refusal carrying no message.
+		$file  = WP_CONTENT_DIR . '/nolinkfn.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			protected function link_available() {
+				return false;
+			}
+		};
+
+		$res = $snaps->create_file( $file, "x\n" );
+
+		$this->assertFalse( $res['success'] );
+		$this->assertSame( 'unsupported_filesystem', $res['error'] );
+		$this->assertSame( 'link() is disabled on this host', $res['detail'] );
+		$this->assertFileDoesNotExist( $file );
+		$this->assertSame( array(), $snaps->list_snapshots(), 'the record is deleted when publish is refused' );
+		$this->assertSame( array(), glob( WP_CONTENT_DIR . '/.aura-create-*' ) );
+	}
+
+	public function test_a_changed_file_is_kept_aside_when_the_host_cannot_link_it_back(): void {
+		$file  = WP_CONTENT_DIR . '/nolinkback.php';
+		$snaps = new class extends Aura_Worker_Snapshots {
+			public $allow_link = true;
+			protected function link_available() {
+				return $this->allow_link;
+			}
+		};
+		$rec = $snaps->create_file( $file, "a\n" )['snapshot'];
+		file_put_contents( $file, "edited\n" );
+		$snaps->allow_link = false;
+
+		$restore = $snaps->restore( $rec['id'] );
+
+		$this->assertFalse( $restore['success'] );
+		$this->assertSame( 'file_changed_since', $restore['error'] );
+		$this->assertArrayHasKey( 'moved_aside', $restore );
+		$this->assertSame( "edited\n", file_get_contents( $restore['moved_aside'] ), 'nothing is deleted on this branch' );
+	}
 }
 
 /**

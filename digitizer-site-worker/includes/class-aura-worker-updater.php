@@ -28,6 +28,12 @@ class Aura_Worker_Updater {
 	const SELF_PLUGIN_FILE = 'digitizer-site-worker/digitizer-site-worker.php';
 
 	/**
+	 * Seconds between lease renewals inside one phase (SA#80). Read through
+	 * `static::` so a test can zero it.
+	 */
+	const LEASE_HEARTBEAT_SECONDS = 60;
+
+	/**
 	 * Load required WordPress upgrade files.
 	 */
 	private function load_upgrade_dependencies() {
@@ -177,6 +183,11 @@ class Aura_Worker_Updater {
 	public function self_update( $zip_url, $expected_sha256 = '' ) {
 		$this->load_upgrade_dependencies();
 
+		$refused = $this->self_mutation_refusal( self::SELF_PLUGIN_FILE );
+		if ( null !== $refused ) {
+			return $refused; // SA#79 — before any claim, download or write
+		}
+
 		// ONE self-update at a time per site (Codex round-20 P1). The verdict
 		// rests on a single nonce option: a second request overlapping the first
 		// overwrote it before the first loopback wrote its beacon, so the first
@@ -300,10 +311,28 @@ class Aura_Worker_Updater {
 		}
 
 		// Install from the verified local file (or the URL when no digest given).
-		$result = $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
+		// Heartbeaten from inside (SA#80): the install is the longest phase, and
+		// renewing only around it left it seizable while it ran. The download
+		// above already sits between two renewals and fires no upgrader filter.
+		$result = $this->heartbeat_during( $fence, function () use ( $upgrader, $install_source ) {
+			return $upgrader->install( $install_source, array( 'overwrite_package' => true ) );
+		} );
 
 		if ( '' !== $tmp && file_exists( $tmp ) ) {
 			wp_delete_file( $tmp );
+		}
+
+		// The files are replaced. If the lease was seized while install() ran,
+		// another self-update owns this directory NOW: it has backed up what
+		// we just wrote and is installing its own build. Restoring our backup
+		// over it, or rolling back on our verdict, would overwrite its work
+		// (Codex #91 round-3 P1). Stop here and say so; the successor's own
+		// verdict and rollback govern the outcome.
+		if ( ! $this->keep_self_update_claim( $fence ) ) {
+			// `installed` is a claim about what happened, so only a result that
+			// IS success counts: WP_Error, false and null (an upgrader that never
+			// reached its install step) are all "not proven" (Codex #94 round-1 P2).
+			return $this->self_update_claim_lost_after_install( $backup_path, ! is_wp_error( $result ) && false !== $result && null !== $result );
 		}
 
 		// A FAILED install is the case that most needs the backup: `install()`
@@ -428,15 +457,27 @@ class Aura_Worker_Updater {
 		$boot_nonce = bin2hex( random_bytes( 16 ) );
 		update_option( 'aura_worker_boot_nonce', $boot_nonce, false );
 
-		// Files are replaced; whatever happens to the lease now, the verdict and
-		// any rollback below are still owed. Renew it and carry on.
-		$this->keep_self_update_claim( $fence );
+		// Files are replaced, and a lost lease here means the same thing it
+		// meant after install(): a successor owns the directory, and the
+		// verdict and rollback below are ITS to run, not ours (Codex #91
+		// round-3 P1 — the shipped comment had it backwards: the rollback is
+		// owed to the site, and the successor is the one that will pay it).
+		if ( ! $this->keep_self_update_claim( $fence ) ) {
+			delete_option( 'aura_worker_boot_nonce' ); // the probe we will not run
+			return $this->self_update_claim_lost_after_install( $backup_path, true );
+		}
 
 		// Did THIS build come up? See `verify_self_update()`.
 		$health_result = $this->verify_self_update( $new_version, $boot_nonce );
 		// Whatever happened, the request for a beacon is spent.
 		delete_option( 'aura_worker_boot_nonce' );
 		$healthy       = ! empty( $health_result['healthy'] );
+
+		// The verdict took a loopback round trip; a claim lost across it means
+		// the rollback below is the successor's to run (SA#93, closed here).
+		if ( ! $this->keep_self_update_claim( $fence ) ) {
+			return $this->self_update_claim_lost_after_install( $backup_path, true, true );
+		}
 
 		if ( ! $healthy && null !== $backup_path ) {
 			// Restoring works even though the on-disk plugin is broken: this
@@ -745,6 +786,107 @@ class Aura_Worker_Updater {
 	}
 
 	/**
+	 * True while the lease is ours — or when no lease was taken ('' fence:
+	 * another plugin's entry, which is not serialised at all).
+	 *
+	 * @param string $fence The fence guarding_self() handed the work.
+	 * @return bool
+	 */
+	private function lease_kept( $fence ) {
+		return '' === (string) $fence || $this->keep_self_update_claim( $fence );
+	}
+
+	/**
+	 * The batch entry for a SiteAgent mutation that lost its claim mid-way.
+	 *
+	 * @param string $plugin_file Plugin.
+	 * @return array { plugin, status, detail }
+	 */
+	private function batch_entry_claim_lost( $plugin_file ) {
+		return array(
+			'plugin' => $plugin_file,
+			'status' => 'failed',
+			'detail' => 'Lost the self-update claim mid-update; another self-update took over on this site',
+		);
+	}
+
+	/**
+	 * Run $work with the self-update lease kept alive from INSIDE it (SA#80,
+	 * Codex #91 round-2): renewing only between phases leaves a phase that
+	 * runs past the takeover window seizable. WordPress's upgrader fires
+	 * sub-phase filters as it goes — download, source selection, pre-install,
+	 * post-install — and a throttled renewal hooked on each keeps a live
+	 * request from ever looking dead. The hooks pass their value through
+	 * untouched and are removed after the phase, whatever it returns.
+	 *
+	 * A lost lease is acted on only where WordPress itself can abort cleanly:
+	 * the three pre-stage filters and `upgrader_clear_destination` answer a
+	 * WP_Error, which the upgrader honours before the stage touches anything
+	 * — the last of them fires immediately before the old directory is
+	 * deleted, so the destructive step itself is fenced (Codex #94 round-8
+	 * P1). What remains unfenced is the copy after that delete: no filter
+	 * fires inside it, and a copy of this plugin runs seconds, not the
+	 * ten-minute takeover window. A phase already past its last abort point
+	 * cannot be stopped halfway without leaving the directory incomplete, so
+	 * `upgrader_post_install` passes through and the check after the phase
+	 * (`lease_kept()`) is where that loss stops the work.
+	 *
+	 * @param string   $fence The fence; '' runs $work plainly (no claim was taken).
+	 * @param callable $work  The phase.
+	 * @return mixed $work's return.
+	 */
+	private function heartbeat_during( $fence, $work ) {
+		if ( '' === (string) $fence ) {
+			return $work();
+		}
+		$last  = time();
+		$lost  = false;
+		// A failed heartbeat is REMEMBERED, and the three PRE-stage filters
+		// answer a WP_Error from then on (Codex #94 round-3 P1): WordPress
+		// honours a WP_Error from `upgrader_pre_download`,
+		// `upgrader_source_selection` and `upgrader_pre_install` by aborting
+		// BEFORE the stage runs — nothing downloaded, unpacked or written — so
+		// a request whose claim was seized between two sub-phases stops at the
+		// upgrader's own abort point instead of installing beside its
+		// successor. `upgrader_clear_destination` is the same kind of point
+		// (Codex #94 round-8 P1): WordPress deletes the old directory INSIDE
+		// that filter (Plugin_Upgrader::delete_old_plugin at priority 10, which
+		// returns a WP_Error it receives untouched), so a beat at priority 1
+		// renews the lease right before the destructive step and a lost claim
+		// stops the phase with the old files still in place.
+		// `upgrader_post_install` fires after the files are replaced; aborting
+		// there would only mislabel a finished install, so it passes its value
+		// through and the boundary check after the phase (`lease_kept()`) is
+		// what stops the work.
+		$hooks = array( 'upgrader_pre_download', 'upgrader_source_selection', 'upgrader_pre_install', 'upgrader_clear_destination', 'upgrader_post_install' );
+		$beats = array(); // one closure per hook: the hook's name is bound, so no current_filter() lookup
+		foreach ( $hooks as $hook ) {
+			$abort          = 'upgrader_post_install' !== $hook;
+			$beats[ $hook ] = function ( $value ) use ( $fence, &$last, &$lost, $abort ) {
+				if ( ! $lost && time() - $last >= static::LEASE_HEARTBEAT_SECONDS ) {
+					$lost = ! $this->keep_self_update_claim( $fence );
+					$last = time();
+				}
+				if ( $lost && $abort ) {
+					return new WP_Error(
+						'aura_self_update_claim_lost',
+						__( 'SiteAgent lost its self-update claim mid-phase; another self-update took over on this site.', 'digitizer-site-worker' )
+					);
+				}
+				return $value;
+			};
+			add_filter( $hook, $beats[ $hook ], 1 );
+		}
+		try {
+			return $work();
+		} finally {
+			foreach ( $beats as $hook => $beat ) {
+				remove_filter( $hook, $beat, 1 );
+			}
+		}
+	}
+
+	/**
 	 * The result for a self-update whose claim was seized before it changed
 	 * anything: another self-update is the one running now.
 	 *
@@ -755,6 +897,29 @@ class Aura_Worker_Updater {
 			'success'     => false,
 			'error'       => __( 'SiteAgent lost its self-update claim before installing; another self-update took over on this site.', 'digitizer-site-worker' ),
 			'in_progress' => true,
+		);
+	}
+
+	/**
+	 * A self-update whose claim was seized AFTER install() replaced the
+	 * files: another self-update took over and now owns the directory, so
+	 * this request neither restores nor verifies. Distinct from
+	 * self_update_claim_lost() (nothing was changed there).
+	 *
+	 * @param string|null $backup_path The backup this request took, if any.
+	 * @param bool        $installed   Whether install() reported success.
+	 * @return array
+	 */
+	private function self_update_claim_lost_after_install( $backup_path, $installed, $health_checked = false ) {
+		return array(
+			'success'        => false,
+			'error'          => __( 'SiteAgent lost its self-update claim after installing; another self-update took over on this site and its own verdict now governs these files.', 'digitizer-site-worker' ),
+			'in_progress'    => true,
+			'installed'      => (bool) $installed,
+			'backed_up'      => null !== $backup_path,
+			'health_checked' => (bool) $health_checked,
+			'rolled_back'    => false,
+			'restore_error'  => null,
 		);
 	}
 
@@ -830,9 +995,12 @@ class Aura_Worker_Updater {
 	 * @param Aura_Worker_Rollback $rollback      Shared rollback helper.
 	 * @param Aura_Worker_Health   $health        Shared health checker.
 	 * @param bool                 $create_backup Whether to back up first.
+	 * @param string               $fence         The self-update claim this entry
+	 *                                            runs under, or '' when the plugin
+	 *                                            is not SiteAgent (SA#80).
 	 * @return array { plugin, status, detail }
 	 */
-	private function batch_update_one( $plugin_file, $rollback, $health, $create_backup ) {
+	protected function batch_update_one( $plugin_file, $rollback, $health, $create_backup, $fence = '' ) {
 		$slug        = dirname( $plugin_file );
 		$backup_path = null;
 		$entry       = array(
@@ -853,16 +1021,36 @@ class Aura_Worker_Updater {
 			}
 		}
 
+		// The lease is renewed between phases when this entry is SiteAgent's
+		// own (SA#80): a generic mutation that outlived the ten-minute window
+		// could be seized and run beside its successor. Losing it means another
+		// self-update owns these files now — stop, and touch nothing further.
+		if ( ! $this->lease_kept( $fence ) ) {
+			return $this->batch_entry_claim_lost( $plugin_file );
+		}
+
 		// 2. Update.
-		$update_result = $this->update_single_plugin( $plugin_file );
+		$update_result = $this->heartbeat_during( $fence, function () use ( $plugin_file ) {
+			return $this->update_single_plugin( $plugin_file );
+		} );
 		if ( ! $update_result['success'] ) {
 			$entry['status'] = 'failed';
 			$entry['detail'] = $update_result['error'];
 			return $entry;
 		}
 
+		if ( ! $this->lease_kept( $fence ) ) {
+			return $this->batch_entry_claim_lost( $plugin_file );
+		}
+
 		// 3. Health check.
 		$health_result = $health->run_health_check();
+		// The probe is a loopback request that can outlive the window too; a
+		// claim lost across it means the rollback below belongs to the
+		// successor (SA#93, closed here).
+		if ( ! $this->lease_kept( $fence ) ) {
+			return $this->batch_entry_claim_lost( $plugin_file );
+		}
 		if ( ! $health_result['healthy'] ) {
 			// 4. Auto-rollback.
 			if ( $backup_path ) {
@@ -896,10 +1084,35 @@ class Aura_Worker_Updater {
 	 */
 	public function restore_plugin_guarded( $rollback, $plugin_slug, $backup_path ) {
 		$plugin_file = 'digitizer-site-worker' === $plugin_slug ? self::SELF_PLUGIN_FILE : $plugin_slug . '/-';
-		$result      = $this->guarding_self( $plugin_file, function () use ( $rollback, $plugin_slug, $backup_path ) {
+		$lost        = false;
+		$result      = $this->guarding_self( $plugin_file, function ( $fence ) use ( $rollback, $plugin_slug, $backup_path, &$lost ) {
+			$this->before_guarded_restore( $fence );
+			// Renewed right before the restore (SA#80). The restore itself is
+			// one ZipArchive::extractTo() of this plugin's own zip — sub-second,
+			// with no seam inside it to heartbeat on, and no safe way to stop
+			// halfway — so it is the one phase kept indivisible.
+			if ( ! $this->lease_kept( $fence ) ) {
+				$lost = true;
+				return null;
+			}
 			return $rollback->restore_plugin( $plugin_slug, $backup_path );
-		}, $busy );
-		return $busy ? $this->self_update_busy() : $result;
+		}, $busy, $refused );
+		if ( null !== $refused ) {
+			return $refused;
+		}
+		if ( $busy || $lost ) {
+			return $this->self_update_busy();
+		}
+		return $result;
+	}
+
+	/**
+	 * Seam between taking the claim and renewing it before a guarded restore.
+	 * Nothing in production; a test ages the claim here.
+	 *
+	 * @param string $fence The fence.
+	 */
+	protected function before_guarded_restore( $fence ) {
 	}
 
 	/**
@@ -908,14 +1121,21 @@ class Aura_Worker_Updater {
 	 * by a self-update, in which case $work is not run and null is returned.
 	 *
 	 * @param string   $plugin_file Plugin being mutated.
-	 * @param callable $work        The mutation.
+	 * @param callable $work        The mutation; receives the fence ('' when no
+	 *                              claim was taken) so it can renew the lease
+	 *                              between long phases (SA#80).
 	 * @param bool     $busy        Out: true when refused for a held claim.
-	 * @return mixed $work's return, or null when busy.
+	 * @param array|null $refused   Out: the SA#79 multisite refusal, or null.
+	 * @return mixed $work's return, or null when busy or refused.
 	 */
-	private function guarding_self( $plugin_file, $work, &$busy ) {
-		$busy = false;
+	private function guarding_self( $plugin_file, $work, &$busy, &$refused = null ) {
+		$busy    = false;
+		$refused = $this->self_mutation_refusal( $plugin_file );
+		if ( null !== $refused ) {
+			return null; // SA#79: nothing runs, no claim is taken
+		}
 		if ( self::SELF_PLUGIN_FILE !== $plugin_file ) {
-			return $work();
+			return $work( '' ); // no claim: another plugin's files are not ours to serialise
 		}
 		if ( ! class_exists( 'Aura_Worker_Magic_Link' ) ) {
 			require_once plugin_dir_path( __FILE__ ) . 'class-aura-worker-magic-link.php';
@@ -926,10 +1146,36 @@ class Aura_Worker_Updater {
 			return null;
 		}
 		try {
-			return $work();
+			return $work( $fence );
 		} finally {
 			Aura_Worker_Magic_Link::release_claim( self::SELF_UPDATE_LOCK, $fence );
 		}
+	}
+
+	/**
+	 * The refusal every Aura-driven mutation of SiteAgent's OWN files answers
+	 * on a multisite network (SA#79): the self-update claim is stored per blog
+	 * while the plugin directory is shared by the whole network, so two
+	 * subsites could each take their own claim and replace the same files
+	 * concurrently. Until the claim lives in network-wide state, every path
+	 * that reaches this directory under that claim — self_update(), the
+	 * generic single update, the batch entry, the guarded rollback — refuses
+	 * before any claim, download or write, rather than racing. Other plugins
+	 * are not this plugin's files and are not refused.
+	 *
+	 * @param string $plugin_file Plugin being mutated.
+	 * @return array|null The refusal, or null when the mutation may proceed.
+	 */
+	private function self_mutation_refusal( $plugin_file ) {
+		if ( self::SELF_PLUGIN_FILE !== $plugin_file || ! function_exists( 'is_multisite' ) || ! is_multisite() ) {
+			return null;
+		}
+		return array(
+			'success'     => false,
+			'code'        => 'aura_self_update_multisite_unsupported',
+			'error'       => __( 'Updating SiteAgent through Aura is not supported on a multisite network: the update lock is per site while the plugin directory is shared. Update the plugin from the network admin.', 'digitizer-site-worker' ),
+			'in_progress' => false,
+		);
 	}
 
 	/**
@@ -959,12 +1205,26 @@ class Aura_Worker_Updater {
 		// other path that can replace these files (Codex round-23 P1): a generic
 		// update landing between a self-update's backup, install and probe would
 		// have the beacon describing one build and the rollback restoring another.
-		$result = $this->guarding_self( $plugin_file, function () use ( $plugin_file ) {
-			$skin     = new Automatic_Upgrader_Skin();
-			$upgrader = new Plugin_Upgrader( $skin );
-			return $upgrader->upgrade( $plugin_file );
-		}, $busy );
-		if ( $busy ) {
+		$lost   = false;
+		$result = $this->guarding_self( $plugin_file, function ( $fence ) use ( $plugin_file, &$lost ) {
+			$r = $this->heartbeat_during( $fence, function () use ( $plugin_file ) {
+				$skin     = new Automatic_Upgrader_Skin();
+				$upgrader = new Plugin_Upgrader( $skin );
+				return $upgrader->upgrade( $plugin_file );
+			} );
+			// A claim lost during the phase (a heartbeat that fired only at
+			// post-install passes through) is a successor owning these files:
+			// the outcome is ITS to report, never a success from here
+			// (Codex #94 round-5 P2).
+			if ( ! $this->lease_kept( $fence ) ) {
+				$lost = true;
+			}
+			return $r;
+		}, $busy, $refused );
+		if ( null !== $refused ) {
+			return $refused;
+		}
+		if ( $busy || $lost ) {
 			return $this->self_update_busy();
 		}
 
@@ -1118,7 +1378,7 @@ class Aura_Worker_Updater {
 	 * @param string $plugin_file Plugin file path (e.g., "akismet/akismet.php").
 	 * @return array { success: bool, error?: string }
 	 */
-	private function update_single_plugin( $plugin_file ) {
+	protected function update_single_plugin( $plugin_file ) {
 		$this->load_upgrade_dependencies();
 
 		$skin     = new Automatic_Upgrader_Skin();
@@ -1168,10 +1428,16 @@ class Aura_Worker_Updater {
 				// SiteAgent's own entry runs under the self-update claim (Codex
 				// round-23 P1); while a self-update holds it, the entry is skipped
 				// and says why, and the rest of the batch is unaffected.
-				$entry = $this->guarding_self( $plugin_file, function () use ( $plugin_file, $rollback, $health, $create_backup ) {
-					return $this->batch_update_one( $plugin_file, $rollback, $health, $create_backup );
-				}, $busy );
-				if ( $busy ) {
+				$entry = $this->guarding_self( $plugin_file, function ( $fence ) use ( $plugin_file, $rollback, $health, $create_backup ) {
+					return $this->batch_update_one( $plugin_file, $rollback, $health, $create_backup, $fence );
+				}, $busy, $refused );
+				if ( null !== $refused ) {
+					$entry = array(
+						'plugin' => $plugin_file,
+						'status' => 'failed',
+						'detail' => $refused['error'],
+					);
+				} elseif ( $busy ) {
 					$entry = array(
 						'plugin' => $plugin_file,
 						'status' => 'skipped',

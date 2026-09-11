@@ -95,7 +95,11 @@ class Aura_Worker_Snapshots {
 
 		if ( null !== $payload ) {
 			$payload_path = $this->dir . $id . '.payload';
-			if ( false === file_put_contents( $payload_path, $payload ) ) {
+			$n            = @file_put_contents( $payload_path, $payload ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- an unwritable/full-disk directory is an expected, handled failure (return false below), not a warning to surface; the byte count is checked, not the return alone.
+			if ( false === $n || $n !== strlen( $payload ) ) {
+				if ( file_exists( $payload_path ) ) {
+					wp_delete_file( $payload_path ); // a partial payload restores garbage; leave nothing
+				}
 				return false;
 			}
 			$meta['payload_path'] = $payload_path;
@@ -106,7 +110,14 @@ class Aura_Worker_Snapshots {
 			return false;
 		}
 		$meta_path = $this->dir . $id . '.json';
-		if ( false === file_put_contents( $meta_path, $json ) ) {
+		$n         = @file_put_contents( $meta_path, $json ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- same as the payload write above: an expected, handled failure.
+		if ( false === $n || $n !== strlen( $json ) ) {
+			if ( file_exists( $meta_path ) ) {
+				wp_delete_file( $meta_path );
+			}
+			if ( isset( $meta['payload_path'] ) && file_exists( $meta['payload_path'] ) ) {
+				wp_delete_file( $meta['payload_path'] );
+			}
 			return false;
 		}
 		$meta['meta_path'] = $meta_path;
@@ -174,6 +185,440 @@ class Aura_Worker_Snapshots {
 			return array( 'success' => false, 'error' => 'Failed to persist snapshot (disk full or unwritable).' );
 		}
 		return array( 'success' => true, 'snapshot' => $record );
+	}
+
+	/** A staged file this old with no create in flight is a crash's leftover. */
+	const STAGE_MAX_AGE = 3600; // one hour — a literal, so the class needs no WordPress constant at load
+
+	/** At most this many stray staged entries are examined per create. */
+	const STAGE_SWEEP_CAP = 50;
+
+	/**
+	 * Create a NEW file with the engine owning the whole create, so no caller
+	 * can leave the record and the file disagreeing (P4.6 piece 2, spec §5).
+	 *
+	 * Stage → record → publish. The complete content is written to a temporary
+	 * file of this call's own name beside the target (same filesystem, never a
+	 * `.php` name — a stray one is data, never served); the record
+	 * `{ kind: file, existed: false, target, expected_sha256, staged }` is
+	 * persisted; the target is published with link(), which is atomic and
+	 * refuses to clobber. There is no point at which the target exists without
+	 * its record, or holds bytes other than the complete content. Both other
+	 * orders were rejected in review: any order in which the TARGET exists
+	 * before the record is complete has a window.
+	 *
+	 * Path validation is the CALLER's: this method trusts `$path` and does no
+	 * jail check of its own — the Power Pack's `resolve_target()` owns that.
+	 *
+	 * @param string $path    Absolute path to create.
+	 * @param string $content Complete file content.
+	 * @return array { success: bool, snapshot?: array, error?: string, detail?: string }
+	 */
+	public function create_file( $path, $content ) {
+		if ( ! is_string( $path ) || '' === $path || ! is_string( $content ) ) {
+			return array( 'success' => false, 'error' => 'create_file: path and content must be strings.' );
+		}
+		$dir  = dirname( $path );
+		$name = basename( $path );
+		if ( ! is_dir( $dir ) ) {
+			return array( 'success' => false, 'error' => 'Directory not found: ' . $dir );
+		}
+		$this->sweep_stale_stages( $dir );
+
+		// Cheap early answer; the AUTHORITATIVE no-clobber check is link()'s.
+		if ( file_exists( $path ) ) {
+			return array( 'success' => false, 'error' => 'exists' );
+		}
+
+		// 1. Stage. Nothing is visible at the target yet.
+		$tmp = $this->stage( $dir, $name, $content );
+		if ( is_array( $tmp ) ) {
+			return $tmp;
+		}
+
+		// 2. Record, with no payload: the record undoes CONTENT AT A PATH, by
+		// hash (the §2 ruling), so the bytes are never stored twice.
+		$sha    = hash( 'sha256', $content );
+		$record = $this->persist_create_record(
+			array(
+				'kind'            => 'file',
+				'target'          => $path,
+				'existed'         => false,
+				'expected_sha256' => $sha,
+				'staged'          => $tmp,
+				'bytes'           => strlen( $content ),
+			)
+		);
+		if ( false === $record ) {
+			$this->discard_stage( $tmp );
+			return array( 'success' => false, 'error' => 'Failed to persist snapshot (disk full or unwritable).' );
+		}
+		// The record's bytes reach the disk BEFORE the target is published
+		// (Codex #94 round-4 P2): persist() writes with file_put_contents(),
+		// which never syncs, so a power loss after link() could leave the
+		// target on disk and the record not. What PHP cannot do is sync a
+		// DIRECTORY entry (a directory cannot be opened as a stream), so the
+		// record's and the target's directory entries are outside this
+		// guarantee — a crash in that window is the same class the staged-name
+		// sweep and prune_older_than() already recover from.
+		if ( ! $this->sync_create_record( $record['meta_path'] ) ) {
+			return $this->abandon_create( $tmp, $record['id'], 'Unable to sync the snapshot record to disk; nothing created.' );
+		}
+		// The record is RE-READ before anything is published (Codex round-1
+		// P1): a short metadata write is the one failure persist() reported as
+		// success, and a target published over an undecodable record has no
+		// rollback point — the exact invariant this method exists to keep.
+		$back = $this->get( $record['id'] );
+		if ( ! is_array( $back )
+			|| 'file' !== ( $back['kind'] ?? '' )
+			|| ( $back['target'] ?? null ) !== $path
+			|| ( $back['existed'] ?? null ) !== false
+			|| ( $back['expected_sha256'] ?? null ) !== $sha
+			|| ( $back['staged'] ?? null ) !== $tmp
+		) {
+			return $this->abandon_create( $tmp, $record['id'], 'Snapshot record did not read back complete (disk full?); nothing created.' );
+		}
+
+		// 3. Publish: atomic, no-clobber.
+		$published = $this->publish( $tmp, $path );
+		if ( true !== $published ) {
+			$out = $this->abandon_create( $tmp, $record['id'], (string) $published );
+			if ( isset( $this->last_publish_detail ) && '' !== $this->last_publish_detail ) {
+				$out['detail'] = $this->last_publish_detail;
+			}
+			return $out;
+		}
+
+		// 4. The staged name is now a second link to the same bytes; drop it.
+		// Failure here is a warning, not an error: the sweep in the next create
+		// and prune_older_than() remove what is left.
+		$this->discard_stage( $tmp );
+
+		// The PERSISTED record keeps `staged` — prune_older_than()'s sweep reads
+		// it from list_snapshots() — but the RETURNED one carries no local path
+		// at all (Codex #94 round-6 P3): step 4 deleted the staged file, and
+		// `meta_path` is this site's directory, not a fact about the snapshot.
+		return array( 'success' => true, 'snapshot' => self::redact( $record ) );
+	}
+
+	/** The last publish() failure's PHP message, for the caller's `detail`. */
+	private $last_publish_detail = '';
+
+	/**
+	 * Write the complete content to a temporary file this call owns, beside
+	 * the target (same directory, so link() is on one filesystem), under an
+	 * opaque name. `xb` is an exclusive create: the name is ours or the call
+	 * fails. A short write leaves nothing behind. `$name` is accepted for the
+	 * seam's signature and deliberately not used.
+	 *
+	 * Protected so a test can model a short write or a refused create.
+	 *
+	 * @param string $dir     Target's directory.
+	 * @param string $name    Target's basename.
+	 * @param string $content Complete content.
+	 * @return string|array The staged path, or { success: false, error }.
+	 */
+	protected function stage( $dir, $name, $content ) {
+		try {
+			$suffix = bin2hex( random_bytes( 8 ) );
+		} catch ( \Exception $e ) {
+			$suffix = substr( md5( uniqid( '', true ) ), 0, 16 );
+		}
+		// OPAQUE: nothing of the target's name is in it. `.agent.php.aura-create-x`
+		// still carries `.php`, and Apache's multi-extension AddHandler semantics
+		// execute such a file (Codex round-1 P1); `.aura-create-<hex>` has no
+		// extension any handler is registered for.
+		$tmp = $dir . '/.aura-create-' . $suffix;
+
+		$fh = @fopen( $tmp, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- An exclusive create is the point: the name is ours or the call fails, and the failure is reported, not thrown.
+		if ( false === $fh ) {
+			return array( 'success' => false, 'error' => 'Unable to stage file beside the target: ' . $dir );
+		}
+		$len     = strlen( $content );
+		$written = 0;
+		while ( $written < $len ) {
+			$n = fwrite( $fh, substr( $content, $written ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fwrite -- $wp_filesystem has no exclusive-create, fsync'd write.
+			if ( false === $n || 0 === $n ) {
+				break;
+			}
+			$written += $n;
+		}
+		$flushed = fflush( $fh );
+		// PHP 8.1+: the bytes reach the disk before the record names them. A
+		// refused fsync() is a refusal to publish (Codex #94 round-3 P2): a crash
+		// after a record that names bytes the disk never took would leave a
+		// missing or partial target under a "success".
+		$synced = function_exists( 'fsync' ) ? (bool) fsync( $fh ) : true;
+		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+
+		if ( $written !== $len || ! $flushed ) {
+			return $this->discard_short_stage( $tmp );
+		}
+		if ( ! $synced ) {
+			$this->discard_stage( $tmp );
+			return array( 'success' => false, 'error' => 'Unable to sync the staged file to disk: ' . $tmp );
+		}
+
+		// fopen() takes the process umask, which on some hosts is group- or
+		// world-writable. link() preserves the mode, so whatever is set here is
+		// what the published target ends up with — and a mode that could not be
+		// set is a refusal, never a publish with whatever fopen() left (Codex
+		// #94 round-1 P1): nothing is staged, nothing is recorded, nothing at
+		// the target.
+		if ( ! $this->secure_stage( $tmp ) ) {
+			$this->discard_stage( $tmp );
+			return array( 'success' => false, 'error' => 'Unable to set permissions on the staged file: ' . $tmp );
+		}
+		return $tmp;
+	}
+
+	/**
+	 * A stage that did not land completely: remove it and answer the error.
+	 *
+	 * @param string $tmp Staged path.
+	 * @return array { success: false, error }
+	 */
+	protected function discard_short_stage( $tmp ) {
+		$this->discard_stage( $tmp );
+		return array( 'success' => false, 'error' => 'Short write while staging (disk full?): ' . $tmp );
+	}
+
+	/**
+	 * Set the staged file's mode to what the published target must carry.
+	 * False when chmod() is unavailable on this host or refuses — the caller
+	 * then discards the stage rather than publishing an unsecured file.
+	 *
+	 * Protected so a test can model a host where the mode cannot be set.
+	 *
+	 * @param string $tmp Staged path.
+	 * @return bool
+	 */
+	protected function secure_stage( $tmp ) {
+		if ( ! function_exists( 'chmod' ) ) {
+			return false;
+		}
+		return (bool) @chmod( $tmp, defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_chmod -- A refusal is an answer this method returns, not a warning to surface; $wp_filesystem is not initialised on this path, and the mode of a file this call exclusively created is not a filesystem abstraction concern.
+	}
+
+	/**
+	 * Publish the staged bytes at the target with link(): atomic, and it
+	 * refuses to clobber. rename() clobbers and is not a substitute.
+	 *
+	 * Protected so a test can model a race (the target appears first) or a
+	 * filesystem that refuses hard links.
+	 *
+	 * @param string $tmp  Staged path.
+	 * @param string $path Target path.
+	 * @return true|string true, 'exists' (the target was there first), or
+	 *                     'unsupported_filesystem' (link() refused; nothing written).
+	 */
+	protected function publish( $tmp, $path ) {
+		$this->last_publish_detail = '';
+		// Fail closed, and SAY so: a host with link() in disable_functions makes
+		// the call warn and return null, which would otherwise be classified
+		// below as an ordinary refusal with no message to explain it.
+		if ( ! $this->link_available() ) {
+			$this->last_publish_detail = 'link() is disabled on this host';
+			return 'unsupported_filesystem';
+		}
+		error_clear_last();
+		$ok = @link( $tmp, $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is an expected answer, not a warning to surface; it is classified below.
+		if ( $ok ) {
+			return true;
+		}
+		$err                       = error_get_last();
+		$this->last_publish_detail = is_array( $err ) && isset( $err['message'] ) ? (string) $err['message'] : '';
+		// The target is there and it is not our bytes → someone landed first.
+		// (If it IS our bytes, a previous attempt's link landed and its stray
+		// staged file is what we are; still 'exists' — this call did not create it.)
+		if ( file_exists( $path ) ) {
+			return 'exists';
+		}
+		// Any other refusal: the filesystem cannot give us an atomic, no-clobber
+		// publish. Fail closed — nothing was written at the target.
+		return 'unsupported_filesystem';
+	}
+
+	/**
+	 * Whether link() can be called on this host — a host may put it in
+	 * disable_functions, where calling it warns and returns null.
+	 *
+	 * Protected so a test can model such a host.
+	 *
+	 * @return bool
+	 */
+	protected function link_available() {
+		return function_exists( 'link' );
+	}
+
+	/**
+	 * Refuse a create after its record was written. Discards the staged file
+	 * and retires the record — every exit after persist_create_record() goes
+	 * through here, because the record of a create that did NOT happen must
+	 * not survive as a restorable one (Codex #94 round-5 P2, round-7 P2): a
+	 * later creator that lands the same bytes at the target — concurrent
+	 * identical creates are the common race — would pass the hash check and
+	 * lose its file to a restore of this orphan. The record is removed, and
+	 * when the unlink is refused it is VOIDED in place so restore refuses it;
+	 * only when even that fails is `stale_record` reported.
+	 *
+	 * @param string $tmp   The staged file.
+	 * @param string $id    The record id.
+	 * @param string $error The refusal.
+	 * @return array { success: false, error: string, stale_record?: string }
+	 */
+	private function abandon_create( $tmp, $id, $error ) {
+		$this->discard_stage( $tmp );
+		$out = array( 'success' => false, 'error' => $error );
+		if ( ! $this->void_create_record( $id ) ) {
+			$out['stale_record'] = $id;
+		}
+		return $out;
+	}
+
+	/**
+	 * Seam: flush the create record to disk. A test models a kernel that
+	 * refuses the sync.
+	 *
+	 * @param string $meta_path The record file.
+	 * @return bool
+	 */
+	protected function sync_create_record( $meta_path ) {
+		return $this->sync_file( $meta_path );
+	}
+
+	/**
+	 * Remove a staged file. Best effort: the sweep and prune cover a miss.
+	 *
+	 * @param string $tmp Staged path.
+	 */
+	private function discard_stage( $tmp ) {
+		if ( is_string( $tmp ) && '' !== $tmp && file_exists( $tmp ) ) {
+			wp_delete_file( $tmp );
+		}
+	}
+
+	/**
+	 * Persist the create record. Seam: a test models a record that persist()
+	 * reported written but that does not read back.
+	 *
+	 * @param array $meta The record.
+	 * @return array|false
+	 */
+	protected function persist_create_record( array $meta ) {
+		return $this->persist( $meta );
+	}
+
+	/**
+	 * Flush one file's bytes to disk. True when fsync() is unavailable (PHP
+	 * < 8.1 — the write already returned and there is nothing more this
+	 * runtime can ask of the kernel); false when the file cannot be opened
+	 * or the kernel refuses. Directory entries are NOT covered: PHP cannot
+	 * open a directory as a stream.
+	 *
+	 * @param string $path File path.
+	 * @return bool
+	 */
+	private function sync_file( $path ) {
+		if ( ! function_exists( 'fsync' ) ) {
+			return true;
+		}
+		$fh = @fopen( $path, 'rb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- A handle only, to fsync a file this class just wrote; the failure is answered, not surfaced as a warning.
+		if ( false === $fh ) {
+			return false;
+		}
+		$ok = fsync( $fh );
+		fclose( $fh ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		return (bool) $ok;
+	}
+
+	/**
+	 * Retire the record of a create that did not happen. Deletes the record
+	 * file; when that is refused, rewrites it without `expected_sha256` and
+	 * with `voided: true`, so restore_created_file() answers "carries no
+	 * expected hash" instead of deleting whatever holds the target now.
+	 *
+	 * @param string $id Snapshot id.
+	 * @return bool True when the record is gone or voided; false when it is
+	 *              still restorable and the caller must say so.
+	 */
+	private function void_create_record( $id ) {
+		$meta_path = $this->dir . basename( (string) $id ) . '.json';
+		$this->delete_record_file( $id );
+		if ( ! file_exists( $meta_path ) ) {
+			return true;
+		}
+		$record = $this->get( $id );
+		if ( ! is_array( $record ) ) {
+			return true; // undecodable: restore cannot act on it either
+		}
+		unset( $record['expected_sha256'], $record['staged'] );
+		$record['voided'] = true;
+		$json = wp_json_encode( $record );
+		if ( false === $json ) {
+			return false;
+		}
+		$n = @file_put_contents( $meta_path, $json ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- The record file this class owns; a refusal is answered to the caller, not surfaced as a warning.
+		return false !== $n && $n === strlen( $json ) && $this->sync_file( $meta_path );
+	}
+
+	/**
+	 * A record as it may leave the engine: without any local filesystem path.
+	 * `staged` (a create in flight), `payload_path` and `meta_path` are this
+	 * site's paths, not facts about the snapshot; every listing or lookup
+	 * that crosses the wire passes its records through here (Codex #94
+	 * round-5 P3 — `GET /aura/v2/snapshots` returned list_snapshots() verbatim).
+	 *
+	 * @param array $record A stored record.
+	 * @return array
+	 */
+	public static function redact( array $record ) {
+		unset( $record['staged'], $record['payload_path'], $record['meta_path'] );
+		return $record;
+	}
+
+	/**
+	 * Remove a record file by id whether or not it decodes — delete() reads
+	 * the record first and cannot remove one that failed to read back.
+	 *
+	 * @param string $id Snapshot id.
+	 */
+	private function delete_record_file( $id ) {
+		$meta_path = $this->dir . basename( (string) $id ) . '.json';
+		if ( file_exists( $meta_path ) ) {
+			wp_delete_file( $meta_path );
+		}
+	}
+
+	/**
+	 * Remove `.aura-create-*` leftovers older than STAGE_MAX_AGE in one
+	 * directory — a crash between staging and the record leaves a stray that
+	 * no record names, and the next create in that directory is the one
+	 * place that looks there. Bounded, and never a `.php` name by construction.
+	 *
+	 * @param string $dir Directory to sweep.
+	 */
+	private function sweep_stale_stages( $dir ) {
+		$cut   = time() - self::STAGE_MAX_AGE;
+		$found = glob( $dir . '/.aura-create-*' );
+		if ( ! is_array( $found ) ) {
+			return;
+		}
+		$n = 0;
+		foreach ( $found as $stray ) {
+			if ( ! is_file( $stray ) ) {
+				continue;
+			}
+			// Counted AFTER the is_file() check, so the cap bounds the files
+			// this sweep actually examines rather than whatever glob() listed.
+			if ( ++$n > self::STAGE_SWEEP_CAP ) {
+				break;
+			}
+			$at = filemtime( $stray );
+			if ( false !== $at && $at < $cut ) {
+				wp_delete_file( $stray );
+			}
+		}
 	}
 
 	/**
@@ -468,6 +913,111 @@ class Aura_Worker_Snapshots {
 	}
 
 	/**
+	 * Undo a create_file(): remove the target ONLY while it still holds the
+	 * bytes the agent wrote (the §2 ruling — byte identity, no inode: a file
+	 * deleted and re-created with the same bytes IS the content this record
+	 * exists to remove; different bytes are never deleted). The check and the
+	 * delete are one file: the path is claimed by an atomic rename first, so
+	 * a replacement arriving in between is never the file that gets deleted.
+	 *
+	 * `.aura-restore-*` files are NEVER swept: one is either a claim in
+	 * flight or a changed file kept aside on purpose (user data).
+	 *
+	 * @param array $record The `existed: false` file record.
+	 * @return array { success: bool, error?: string }
+	 */
+	private function restore_created_file( array $record ) {
+		$target = isset( $record['target'] ) ? (string) $record['target'] : '';
+		if ( '' === $target || ! self::path_present( $target ) ) {
+			return array( 'success' => true ); // already gone
+		}
+		// is_file() follows a symlink, so a DANGLING one reads as absent to
+		// file_exists() and as "not a file" here — it is a directory entry that
+		// can go live the moment its destination appears, never "already gone"
+		// (Codex #94 round-2 P2). It is reported, never deleted.
+		if ( ! is_file( $target ) ) {
+			return array( 'success' => false, 'error' => 'Target is not a regular file: ' . $target );
+		}
+		$expected = isset( $record['expected_sha256'] ) ? (string) $record['expected_sha256'] : '';
+		if ( '' === $expected ) {
+			return array( 'success' => false, 'error' => 'Snapshot record carries no expected hash.' );
+		}
+
+		// CLAIM the pathname before verifying anything (Codex #91 round-1 P1):
+		// hash-then-unlink had a window in which another process could replace
+		// the target and this call would delete bytes it never verified.
+		// rename() is atomic and keeps the inode, so what we hash below is
+		// exactly what we may delete, and whatever lands at the path after this
+		// line is not ours and is never touched.
+		try {
+			$suffix = bin2hex( random_bytes( 8 ) );
+		} catch ( \Exception $e ) {
+			$suffix = substr( md5( uniqid( '', true ) ), 0, 16 );
+		}
+		$claim = dirname( $target ) . '/.aura-restore-' . $suffix; // opaque, never a .php name
+		if ( ! @rename( $target, $claim ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged,WordPress.WP.AlternativeFunctions.rename_rename -- The claim IS the point; $wp_filesystem->move() may copy+delete, which is neither atomic nor inode-preserving.
+			return self::path_present( $target )
+				? array( 'success' => false, 'error' => 'Unable to claim file for restore: ' . $target )
+				: array( 'success' => true ); // it vanished between exists() and the claim: already gone
+		}
+		$this->after_claim( $claim, $target );
+
+		$actual = hash_file( 'sha256', $claim );
+		if ( is_string( $actual ) && hash_equals( $expected, $actual ) ) {
+			// The agent's bytes, verified on the file we hold. Remove them.
+			wp_delete_file( $claim );
+			if ( file_exists( $claim ) ) {
+				// The agent's bytes are still on disk under the claim name; say
+				// where, as the file_changed_since branch below does.
+				return array( 'success' => false, 'error' => 'Failed to delete file: ' . $claim, 'moved_aside' => $claim );
+			}
+			return array( 'success' => true );
+		}
+
+		// Not the agent's bytes: put the file back, without clobbering anything
+		// that took the path meanwhile. link() is no-clobber; a refusal means the
+		// path is taken — the changed file stays beside it under its claim name
+		// and the answer says where. Nothing is ever deleted on this branch.
+		$out = array( 'success' => false, 'error' => 'file_changed_since' );
+		// A host without link() takes the moved_aside branch outright: nothing is
+		// attempted at the target and, as on every path here, nothing is deleted.
+		if ( $this->link_available() && @link( $claim, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- EEXIST is the expected refusal, classified below.
+			wp_delete_file( $claim ); // the second name to the same inode; the file is back at its path
+			if ( file_exists( $claim ) ) {
+				// The file is back, but its claim name could not be removed and
+				// `.aura-restore-*` is never swept: say where it is, as the
+				// matching-hash branch does (Codex #94 round-7 P2).
+				$out['moved_aside'] = $claim;
+			}
+		} else {
+			$out['moved_aside'] = $claim;
+		}
+		return $out;
+	}
+
+	/**
+	 * Whether a directory entry exists at the path — a regular file, a
+	 * directory, or a symlink whether or not its destination exists.
+	 * file_exists() alone answers false for a dangling symlink.
+	 *
+	 * @param string $path Path.
+	 * @return bool
+	 */
+	private static function path_present( $path ) {
+		return file_exists( $path ) || is_link( $path );
+	}
+
+	/**
+	 * Seam between claiming the target and verifying it. Nothing in
+	 * production; a test models a concurrent writer landing at the path here.
+	 *
+	 * @param string $claim  The claimed (renamed) file.
+	 * @param string $target The original path.
+	 */
+	protected function after_claim( $claim, $target ) {
+	}
+
+	/**
 	 * Load a snapshot record by id.
 	 *
 	 * @param string $id Snapshot id.
@@ -580,6 +1130,9 @@ class Aura_Worker_Snapshots {
 
 		switch ( $record['kind'] ) {
 			case 'file':
+				if ( isset( $record['existed'] ) && false === $record['existed'] ) {
+					return $this->restore_created_file( $record );
+				}
 				$payload_path = $record['payload_path'] ?? '';
 				if ( ! $payload_path || ! file_exists( $payload_path ) ) {
 					return array( 'success' => false, 'error' => 'Snapshot payload missing.' );
@@ -869,10 +1422,23 @@ class Aura_Worker_Snapshots {
 		$network   = function_exists( 'is_multisite' ) && is_multisite();
 		$main_site = ! $network || ! function_exists( 'is_main_site' ) || is_main_site();
 		foreach ( $this->list_snapshots() as $rec ) {
-			if ( ! in_array( (string) ( $rec['door_kind'] ?? '' ), $kinds, true ) ) {
+			if ( $network && ! self::prunable_here( $rec, $main_site ) ) {
 				continue;
 			}
-			if ( $network && ! self::prunable_here( $rec, $main_site ) ) {
+			// A create_file() that died between its record and its publish
+			// leaves the staged bytes beside the target (spec §5 step 4). The
+			// record stays — restore on it is "already gone" — but the bytes go.
+			// Reached only for THIS blog's records (the check above).
+			if ( 'file' === ( $rec['kind'] ?? '' ) && isset( $rec['existed'] ) && false === $rec['existed'] && ! empty( $rec['staged'] ) ) {
+				$staged = (string) $rec['staged'];
+				if ( is_file( $staged ) ) {
+					$at = filemtime( $staged );
+					if ( false !== $at && $at < time() - self::STAGE_MAX_AGE ) {
+						wp_delete_file( $staged );
+					}
+				}
+			}
+			if ( ! in_array( (string) ( $rec['door_kind'] ?? '' ), $kinds, true ) ) {
 				continue;
 			}
 			// The stamp persist() wrote is a UTC wall clock with no zone on it.

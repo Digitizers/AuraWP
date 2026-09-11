@@ -156,7 +156,7 @@ final class RulesEnforcementTest extends TestCase {
 		$this->assertSame( 'aura_rule_blocked', $res['code'] );
 		$this->assertSame( 403, $res['status'] );
 		$this->assertSame( 'rule/checkout', $res['rule']['key'] );
-		$this->assertStringContainsString( 'release the rule', $res['error'] );
+		$this->assertStringContainsString( 'scope the rule', $res['error'] );
 		$this->assertSame( 0, SA_Recording_Tool::$ran, 'a blocked tool executed' );
 		$this->assertCount( 1, $this->fired( 'aura_worker_rule_blocked' ) );
 	}
@@ -369,7 +369,7 @@ final class RulesEnforcementTest extends TestCase {
 		// blocked_result()'s exact wording — the point of this test is that it
 		// still says this even though a valid grant was presented.
 		$this->assertStringContainsString( 'rule/checkout', $data['error'] );
-		$this->assertStringContainsString( 'approval does not override a rule; release the rule first', $data['error'] );
+		$this->assertStringContainsString( 'approval does not override a rule; scope the rule out of this site with `sites`, or release it', $data['error'] );
 		$this->assertSame( 0, SA_Recording_Tool::$ran, 'a rule-blocked call under a valid grant still ran the tool' );
 	}
 

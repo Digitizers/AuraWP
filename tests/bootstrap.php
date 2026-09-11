@@ -1484,6 +1484,12 @@ if ( ! function_exists( 'wp_mkdir_p' ) ) {
 
 if ( ! function_exists( 'wp_delete_file' ) ) {
 	function wp_delete_file( string $file ): bool {
+		// `_wp_delete_file_fail` names ONE path whose delete refuses without
+		// touching the file — a directory the process may write but not unlink
+		// from. Callers that must say where the bytes are can be tested there.
+		if ( isset( $GLOBALS['_wp_delete_file_fail'] ) && (string) $GLOBALS['_wp_delete_file_fail'] === $file ) {
+			return false;
+		}
 		$existed = file_exists( $file );
 		$ok      = @unlink( $file );
 		if ( $existed && $ok ) {
@@ -1657,6 +1663,11 @@ if ( ! class_exists( 'Plugin_Upgrader' ) ) {
 
 		public function upgrade( $plugin_file ) {
 			$GLOBALS['_mutations'][] = 'Plugin_Upgrader::upgrade';
+			// `_upgrade_effect` models what happens WHILE the upgrade runs (a
+			// claim seized mid-phase), the way `_install_effect` does for install().
+			if ( isset( $GLOBALS['_upgrade_effect'] ) && is_callable( $GLOBALS['_upgrade_effect'] ) ) {
+				call_user_func( $GLOBALS['_upgrade_effect'] );
+			}
 			return true;
 		}
 
@@ -1668,7 +1679,8 @@ if ( ! class_exists( 'Plugin_Upgrader' ) ) {
 			if ( isset( $GLOBALS['_install_effect'] ) && is_callable( $GLOBALS['_install_effect'] ) ) {
 				call_user_func( $GLOBALS['_install_effect'] );
 			}
-			return $GLOBALS['_install_result'] ?? true;
+			// array_key_exists, not ??: a test may set null to model an upgrader that never reached its install step.
+			return array_key_exists( '_install_result', $GLOBALS ) ? $GLOBALS['_install_result'] : true;
 		}
 	}
 }
@@ -4722,19 +4734,33 @@ if ( ! function_exists( 'wp_trash_post' ) ) {
 
 if ( ! function_exists( 'get_posts' ) ) {
 	function get_posts( array $args = array() ) {
-		$types  = (array) ( $args['post_type'] ?? 'post' );
-		$status = $args['post_status'] ?? 'publish';
-		$out    = array();
+		if ( ! empty( $GLOBALS['_sa_get_posts_effect'] ) && is_callable( $GLOBALS['_sa_get_posts_effect'] ) ) {
+			( $GLOBALS['_sa_get_posts_effect'] )( $args ); // a test models a failing statement (sets $wpdb->last_error)
+		}
+		$types    = (array) ( $args['post_type'] ?? 'post' );
+		$statuses = (array) ( $args['post_status'] ?? 'publish' );
+		$limit    = (int) ( $args['posts_per_page'] ?? -1 );
+		$out      = array();
 		foreach ( $GLOBALS['_posts'] as $id => $p ) {
 			if ( ! in_array( $p->post_type ?? '', $types, true ) ) {
 				continue;
 			}
-			if ( 'any' !== $status && ( $p->post_status ?? '' ) !== $status ) {
+			if ( ! in_array( 'any', $statuses, true ) && ! in_array( $p->post_status ?? '', $statuses, true ) ) {
 				continue;
 			}
 			$out[] = ( 'ids' === ( $args['fields'] ?? '' ) ) ? (int) $id : $p;
+			if ( $limit > 0 && count( $out ) >= $limit ) {
+				break;
+			}
 		}
 		return $out;
+	}
+}
+
+if ( ! function_exists( 'post_type_exists' ) ) {
+	/** Registered post types — a test registers one with $GLOBALS['_post_types'][ $type ] = true. */
+	function post_type_exists( $post_type ): bool {
+		return ! empty( $GLOBALS['_post_types'][ (string) $post_type ] );
 	}
 }
 
@@ -5133,8 +5159,11 @@ function sa_reset_state(): void {
 	$GLOBALS['_sa_app_password_scan_rewrite_probe'] = null; // stamps the OWNER rows of that answer with a foreign nonce (#434 Task 10).
 	$GLOBALS['_sa_steal_site_claim_during_mint'] = false;
 	$GLOBALS['_sa_app_password_create_fails']    = false;
+	$GLOBALS['_wp_delete_file_fail'] = null; // ONE path whose wp_delete_file() refuses; see the stub above.
 	$GLOBALS['_abilities']    = array();
 	$GLOBALS['_options']      = array();
+	$GLOBALS['_post_types']   = array(); // post_type_exists() — see the stub beside get_posts().
+	unset( $GLOBALS['_sa_get_posts_effect'] ); // get_posts()'s per-test effect hook.
 	$GLOBALS['_transients']   = array();
 	$GLOBALS['_caps']         = null;
 	$GLOBALS['_logged_in']    = false;

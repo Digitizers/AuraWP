@@ -123,16 +123,32 @@ abstract class Aura_Tool_Base {
 	/**
 	 * Get the full metadata array for this tool (used by list_tools).
 	 *
+	 * Empty maps are emitted as `{}`, never `[]` (SA#83): `json_encode` turns
+	 * an empty PHP array into a JSON list, and a consumer typing `parameters`
+	 * as an object (Claude Code, via Aura's gateway — Aura#482) rejected the
+	 * entire fleet listing over one parameterless tool. Same shape the
+	 * Abilities API already uses for `properties`.
+	 *
 	 * @return array
 	 */
 	public function get_metadata() {
 		return array(
 			'name'        => $this->get_name(),
 			'description' => $this->get_description(),
-			'parameters'  => $this->get_parameters(),
-			'returns'     => $this->get_returns(),
-			'annotations' => $this->get_annotations(),
+			'parameters'  => self::as_object_when_empty( $this->get_parameters() ),
+			'returns'     => self::as_object_when_empty( $this->get_returns() ),
+			'annotations' => self::as_object_when_empty( $this->get_annotations() ),
 		);
+	}
+
+	/**
+	 * An empty map serialises as `{}`; a non-empty one is returned as-is.
+	 *
+	 * @param mixed $map A map (assoc array).
+	 * @return array|\stdClass
+	 */
+	protected static function as_object_when_empty( $map ) {
+		return ( is_array( $map ) && empty( $map ) ) ? (object) array() : $map;
 	}
 
 	/**

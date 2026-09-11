@@ -259,6 +259,11 @@ from WordPress is loaded). `tests/unit/*Test.php`, one class per subject; `sa_re
 - The `$wpdb` stub matches statements by regex and throws on an unrecognised
   `_application_passwords` shape, so a reformatted production query fails loudly instead of
   proving nothing. A new statement shape is taught to the stub in the same PR.
+- `get_posts()` honours an array `post_status` and `posts_per_page`, and runs
+  `$GLOBALS['_sa_get_posts_effect']( $args )` first when set (a test models a failing statement
+  by setting `$wpdb->last_error` there); `post_type_exists()` reads `$GLOBALS['_post_types']`
+  (register one with `$GLOBALS['_post_types']['angie_snippet'] = true`). All since 2.17.0
+  (`audit_agent_code`).
 
 ---
 
