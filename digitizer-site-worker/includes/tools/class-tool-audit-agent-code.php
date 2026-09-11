@@ -59,7 +59,7 @@ class Aura_Tool_Audit_Agent_Code extends Aura_Tool_Base {
 
 	public function get_returns() {
 		return array(
-			'angie_snippets' => 'object — { installed, version } and, when installed: module_active, total|published|drafts|agent_authored (int|null — null when the CPT read failed or hit its cap of 500), active_env ("prod"|"dev"|null — the environment Angie\'s loader includes for THIS request; null when the dev-mode API is not callable or the snippet module is inactive), deployed: { prod: { dirs, agent_authored, orphan }, dev: {…} } (int|null per environment — directories named snippet-<post_id> that contain main.php, joined to the CPT by id; orphan = no row, which the loader still includes), latest_deploy_at: { prod, dev } (ISO8601|null, per environment, never a max across both), recent: [{ id, title, status, agent_authored, environments, modified }] (newest first, cap 20; recent_truncated when cut — never bounds a count), coverage: { total_seen, returned, truncated, cap } (the DIRECTORY WALK only, 200 entries per environment). Absent Angie: { installed: false, version: "" }. A scan that threw: { error }.',
+			'angie_snippets' => 'object — { installed, version } (installed = loaded at runtime OR present in the installed-plugin inventory, so a deactivated Angie still reports its dormant rows and directories) and, when installed: module_active, total|published|drafts|agent_authored (int|null — null when the CPT read failed or hit its cap of 500), active_env ("prod"|"dev"|null — the environment Angie\'s loader includes for THIS request; null when the dev-mode API is not callable or the snippet module is inactive), deployed: { prod: { dirs, agent_authored, orphan }, dev: {…} } (int|null per environment — directories named snippet-<post_id> that contain main.php, joined to the CPT by id; orphan = no row, which the loader still includes), latest_deploy_at: { prod, dev } (ISO8601|null, per environment, never a max across both), recent: [{ id, title, status, agent_authored, environments, modified }] (newest first, cap 20; recent_truncated when cut — never bounds a count), coverage: { total_seen, returned, truncated, cap } (the DIRECTORY WALK only, 200 entries per environment). Absent Angie: { installed: false, version: "" }. A scan that threw: { error }.',
 			'power_pack'     => 'object — { installed, version, execute_php, fs_write, wp_cli } from AURA_POWER_PACK_VERSION / AURA_POWER_EXECUTE_PHP / AURA_POWER_ALLOW_FS_WRITE / AURA_POWER_ALLOW_WP_CLI; every flag false when not installed',
 			'third_party'    => 'object — { emcp_sandbox: { present, version }, atarim_exec: { present } }',
 			'counters_as_of' => 'string — ISO8601 instant the counts were taken',
@@ -301,14 +301,55 @@ class Aura_Tool_Audit_Agent_Code extends Aura_Tool_Base {
 		return opendir( $dir );
 	}
 
-	/** Seam: Angie's presence (defined('ANGIE_VERSION') || class_exists('\Angie\Plugin')). */
+	/**
+	 * Seam: Angie's presence — loaded at runtime (`ANGIE_VERSION` /
+	 * `\Angie\Plugin`) OR on disk in the installed-plugin inventory. A
+	 * deactivated Angie loads nothing, but its CPT rows and every deployed
+	 * `snippet-<id>/main.php` are still there, dormant: exactly the code
+	 * this audit exists to count (Codex #94 round-6 P2). `module_active` is
+	 * the runtime signal; this one is not.
+	 */
 	protected function angie_installed() {
-		return defined( 'ANGIE_VERSION' ) || class_exists( '\\Angie\\Plugin' );
+		return defined( 'ANGIE_VERSION' ) || class_exists( '\\Angie\\Plugin' ) || is_array( $this->angie_header() );
 	}
 
-	/** Seam: Angie's version, '' when unknown. */
+	/** Seam: Angie's version — the loaded constant, else the inventory header, else ''. */
 	protected function angie_version() {
-		return defined( 'ANGIE_VERSION' ) ? (string) ANGIE_VERSION : '';
+		if ( defined( 'ANGIE_VERSION' ) ) {
+			return (string) ANGIE_VERSION;
+		}
+		$header = $this->angie_header();
+		return is_array( $header ) && isset( $header['Version'] ) ? (string) $header['Version'] : '';
+	}
+
+	/** Angie's main plugin file in the installed-plugin inventory. */
+	const PLUGIN_FILE = 'angie/angie.php';
+
+	/**
+	 * Seam: the installed-plugin inventory's header for Angie's own file, or
+	 * null when absent or unreadable. Same shape and precedent as
+	 * audit_mcp_exposure's `elementor_plugin_header()`: `get_plugins()`,
+	 * deliberately NOT `is_plugin_active()` — a deactivated plugin remaining
+	 * on disk is the case this exists to report; any environment quirk
+	 * degrades to "not in inventory", never a fatal in a read-only audit.
+	 *
+	 * @return array|null
+	 */
+	protected function angie_header() {
+		if ( ! defined( 'ABSPATH' ) ) {
+			return null;
+		}
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		if ( ! function_exists( 'get_plugins' ) ) {
+			return null;
+		}
+		$plugins = get_plugins();
+		if ( ! is_array( $plugins ) || ! isset( $plugins[ self::PLUGIN_FILE ] ) || ! is_array( $plugins[ self::PLUGIN_FILE ] ) ) {
+			return null;
+		}
+		return $plugins[ self::PLUGIN_FILE ];
 	}
 
 	/** Seam: is the snippet module's CPT registered? */

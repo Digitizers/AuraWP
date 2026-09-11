@@ -115,6 +115,37 @@ final class AgentCodeAuditTest extends TestCase {
 		$this->assertFalse( $a['supports_preview'] );
 	}
 
+	public function test_a_deactivated_angie_on_disk_is_installed_with_its_dormant_rows_and_directories(): void {
+		// Codex #94 round-6 P2: a deactivated Angie loads no constant and no
+		// class, but its CPT rows and deployed snippet directories are still
+		// there — dormant code, the thing this audit counts. installed comes
+		// from the inventory; module_active (runtime) stays false; active_env
+		// is null because no loader runs.
+		$this->row( 1, 'publish', true, '2026-09-01 10:00:00', 'Agent one' );
+		$this->dir( 'prod', 'snippet-1' );
+		$t = new class extends Aura_Tool_Audit_Agent_Code {
+			protected function angie_header() {
+				return array( 'Name' => 'Angie', 'Version' => '1.1.16' );
+			}
+		};
+
+		$a = $t->execute( array() )['angie_snippets'];
+
+		$this->assertTrue( $a['installed'] );
+		$this->assertSame( '1.1.16', $a['version'], 'the inventory header supplies the version' );
+		$this->assertFalse( $a['module_active'] );
+		$this->assertNull( $a['active_env'] );
+		$this->assertSame( 1, $a['total'] );
+		$this->assertSame( 1, $a['agent_authored'] );
+		$this->assertSame( array( 'dirs' => 1, 'agent_authored' => 1, 'orphan' => 0 ), $a['deployed']['prod'] );
+	}
+
+	public function test_angie_absent_from_runtime_and_inventory_is_installed_false(): void {
+		$GLOBALS['_installed_plugins'] = array( 'akismet/akismet.php' => array( 'Name' => 'Akismet', 'Version' => '1.0' ) );
+		$t = new Aura_Tool_Audit_Agent_Code();
+		$this->assertSame( array( 'installed' => false, 'version' => '' ), $t->execute( array() )['angie_snippets'] );
+	}
+
 	public function test_angie_absent_is_installed_false_and_nothing_else_in_that_subtree(): void {
 		$r = $this->tool( array( 'installed' => false ) )->execute( array() );
 		$this->assertSame( array( 'installed' => false, 'version' => '' ), $r['angie_snippets'] );

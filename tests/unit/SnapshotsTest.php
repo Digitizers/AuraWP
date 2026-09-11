@@ -572,6 +572,7 @@ final class SnapshotsTest extends TestCase {
 		$this->assertSame( hash( 'sha256', "<?php // agent\n" ), $rec['expected_sha256'] );
 		$this->assertArrayNotHasKey( 'payload_path', $rec, 'a created file has no payload — the record undoes content at a path' );
 		$this->assertArrayNotHasKey( 'staged', $rec, 'the returned record carries no local path' );
+		$this->assertArrayNotHasKey( 'meta_path', $rec, 'nor the record file\'s own path' );
 		$this->assertFileDoesNotExist( $snaps->get( $rec['id'] )['staged'], 'the staged file is removed after publish' );
 		$this->assertSame( 0644, fileperms( $file ) & 0777, 'the created file does not inherit the umask' );
 

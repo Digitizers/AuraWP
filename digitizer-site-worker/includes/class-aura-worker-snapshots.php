@@ -309,11 +309,10 @@ class Aura_Worker_Snapshots {
 		$this->discard_stage( $tmp );
 
 		// The PERSISTED record keeps `staged` — prune_older_than()'s sweep reads
-		// it from list_snapshots() — but the RETURNED one must not: step 4
-		// deleted that file, so it is a dead local path a caller could put on the wire.
-		unset( $record['staged'] );
-
-		return array( 'success' => true, 'snapshot' => $record );
+		// it from list_snapshots() — but the RETURNED one carries no local path
+		// at all (Codex #94 round-6 P3): step 4 deleted the staged file, and
+		// `meta_path` is this site's directory, not a fact about the snapshot.
+		return array( 'success' => true, 'snapshot' => self::redact( $record ) );
 	}
 
 	/** The last publish() failure's PHP message, for the caller's `detail`. */
